@@ -1,0 +1,15 @@
+# ── 非本项目产出的第三方参考资料，不入库 ──
+AstrBot插件开发指南总结.md
+新建 文本文档.txt
+
+# ── 运行时/编辑器杂物 ──
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# ── 脱敏前的原始副本（本地留存，不入库）──
+_raw-before-sanitize-*.zip

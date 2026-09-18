@@ -1,0 +1,2 @@
+# 网络请求必须使用异步库；AstrBot 规范禁止 requests。
+aiohttp>=3.9

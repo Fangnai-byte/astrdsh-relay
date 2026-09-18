@@ -1,0 +1,434 @@
+# AstrDsh Relay（星驿）接口契约 v1（草案 / 冻结候选）
+
+> 状态：**设计冻结候选**。所有标记 `【已证实】` 的条项来自两侧源码实读（证据见
+> `docs/astrbot-side-capabilities.md`、`docs/dsh-side-capabilities.md`）；
+> 标记 `【未核实】` 的条项**不得**在实现阶段当作既成事实使用。
+>
+> 本文档是 AstrBot 侧与 DSH 侧的**唯一接口真相来源**。两侧骨架代码中的任何字段
+> 与此冲突，以本文档为准。
+
+---
+
+## 0. 角色与命名
+
+| 角色 | 实体 | 说明 |
+|---|---|---|
+| **IM 侧（Agent）** | AstrBot Star 插件 `astrbot_plugin_dsh_relay` | 客户端。发起所有连接。 |
+| **DSH 侧（Server）** | DSH host 插件 `dsh-astrbot-relay` | 服务端。拥有会话与审批。 |
+| **conversation** | 一个 IM 会话线程（群/私聊/话题） | 由 AstrBot `unified_msg_origin` 唯一标识。 |
+
+**连接方向是单向的：IM 侧 → DSH 侧。** DSH 侧永不主动拨号回 AstrBot。
+这条约束是为了让跨机/容器部署只需要放通一个方向的入站端口，NAT 后也能工作。
+所有「DSH 主动推送」（流式文本、工具事件、审批请求、任务完成通知）都复用
+IM 侧已建立的那条 SSE 下行通道，不需要第二条连接。
+
+---
+
+## 1. 决策记录：为什么不用现成的 `/api/<method>` RPC 面
+
+DSH Web 已经暴露了一条 RPC 面，本机既有的 `astrbot_plugin_dsh_connector` v2.0.1
+就在用它。我们没有采用，理由如下（均为实读证据，非偏好）：
+
+| # | 事实 | 后果 |
+|---|---|---|
+| 1 | `/api` 请求先过 **Host/Origin 栅栏**：Host 必须是 loopback 或配置里显式列出的 `trustedHosts` authority【已证实】 | 跨机部署需要维护 `trustedHosts`，且容器内 Host 头常与配置不一致 |
+| 2 | `/api` 的浏览器鉴权是 **进程启动 token → 签名 cookie**（`BrowserAuth`：root URL query token 换 authority-bound cookie）【已证实】 | 非浏览器客户端没有一等公民的 Bearer/API-Key 路径，只能模仿浏览器握手，脆弱 |
+| 3 | 现有 connector 的流式实现依赖 `assistant/chunk`【已证实：`core/dsh_client.py:459`】 | 该事件名在当前 DSH 版本**已被删除**（v0 遗留），流式路径实际已失效 |
+| 4 | 该面只能**轮询** `session.history` 取结果【已证实：`dsh_client.py:441-495`】 | 延迟 = `poll_interval`；不是推模型 |
+| 5 | **审批无法通过该面拦截**【已证实：审批是进程内 waterfall】 | 设计第 4 层（审批转发）在这一路线上**不可能实现** |
+
+**结论**：写一个自有路由的 DSH host 插件。它的 4 个理由里第 5 条是硬约束，
+其余 4 条是收益。既有 connector 的价值降级为：**RPC 方法名与语义的参考词典**
+（`session.create` / `session.prompt` / `session.history` / `workspace.archiveSession`
+等），以及**同机 MVP 的兜底通道**。
+
+---
+
+## 2. 会话标识与映射
+
+### 2.1 键的选择
+
+**使用 AstrBot 的 `unified_msg_origin`（UMO）作为 conversation key 原文。**
+
+- 格式【已证实】：`{platform_id}:{MessageType}:{session_id}`，
+  例如 `default:FriendMessage:1000000001`、`default:GroupMessage:123456`。
+- **不采用**原始设计里的 `platform:group:user` 三元组。理由：UMO 已经内建了
+  私聊/群聊区分，而三元组在私聊场景下 `group_id` 为空、会把同一用户的不同私聊
+  折叠到一起；群聊场景下把 `user_id` 放进 key 会让同一群内每个用户各拿一个
+  DSH 会话，与「一个 IM 对话 ↔ 一个 DSH Session」的语义相反。
+
+### 2.2 映射状态（DSH 侧持有，权威）
+
+```jsonc
+{
+  "conversation": "default:GroupMessage:123456",  // UMO 原文
+  "dshSessionId": "im-3f9a1c7e-...",              // 由 DSH 侧生成
+  "createdAt": 1700000000000,
+  "lastActiveAt": 1700000000000,
+  "policy": "one-to-one",                          // one-to-one | on-demand | daily
+  "seq": 42                                        // 该会话已发出的最大事件序号
+}
+```
+
+- **持久化位置**：DSH 侧插件的 `statePath` 配置项指向的 JSON 文件（默认
+  `<DSH_HOME>/astrbot-relay/state.json`）。**不使用** `ctx.storage`——该 API 本轮
+  未核实，不写进契约。
+- 写入必须原子（临时文件 + rename），避免崩溃留下半截 JSON。
+
+### 2.3 轮转策略
+
+契约只规定**行为**，不规定默认值（默认值属实现配置）：
+
+| policy | 行为 |
+|---|---|
+| `one-to-one` | 一个 conversation 固定一个 DSH 会话，长期保持。 |
+| `on-demand` | 首次触发创建；`idleTtlMs` 内无活动则回收（归档，不删除历史）。 |
+| `daily` | 按 DSH 服务器本地日期轮转，跨日新建。 |
+
+回收/轮转时的 DSH 会话走 `workspace.archiveSession`【已证实存在于 RPC 面，
+插件内对应能力【未核实】】，保留历史日志。
+
+---
+
+## 3. 传输协议
+
+基址由 IM 侧配置项 `bridge_url` 给出（如 `https://dsh.example.com/astrbot-relay`）。
+下述路径均相对该基址。
+
+**通用要求**：所有端点都要求鉴权（见 §5）。请求与响应体一律 `application/json;
+charset=utf-8`。未知字段必须忽略（前向兼容）；未知的 `type` 值也必须忽略。
+
+### 3.1 `POST /message` — 投递一条 IM 用户消息
+
+请求：
+
+```jsonc
+{
+  "conversation": "default:GroupMessage:123456",
+  "text": "帮我看下这个报错",
+  "messageId": "1000000001-8821",     // IM 侧消息 id，仅用于日志与去重辅助
+  "sender": { "id": "1000000001", "name": "user" },
+  "meta": { "platform": "aiocqhttp", "messageType": "GroupMessage" }
+}
+```
+
+必填请求头：
+
+| 头 | 说明 |
+|---|---|
+| `Authorization` | `Bearer <token>` |
+| `Idempotency-Key` | **必填**，UUIDv4。同 key 重复请求不得造成第二次投递。 |
+
+响应 `202 Accepted`：
+
+```jsonc
+{ "accepted": true, "conversation": "...", "queueDepth": 1, "duplicate": false }
+```
+
+- `duplicate: true` 表示命中幂等表，本次未投递。
+- 若该 conversation 队列已满 → `429`（见 §6.3）。
+- 若 DSH 侧尚无该 conversation 的映射，**由服务端按 `policy` 创建**，
+  IM 侧不负责建会话。
+
+### 3.2 `GET /events?conversation=<umo>` — SSE 下行通道
+
+- `Content-Type: text/event-stream`；每条消息以空行结尾【已证实这是 SSE 的硬要求】。
+- 连接建立后服务端立即发一帧 `: connected` 注释行作为热身。
+- **断线重连**：SSE 标准 `Last-Event-ID` 请求头。客户端重连时必须携带最后收到的
+  `seq`；服务端从环形缓冲重放 `> seq` 的事件。缓冲区大小由
+  `eventBufferSize` 配置（默认 512），溢出时最旧的丢弃并发送一帧
+  `{"type":"gap","fromSeq":N}` 告知客户端存在空洞。
+- 每帧：
+
+```jsonc
+{ "seq": 43, "ts": 1700000000123, "type": "text/delta", "text": "好的，" }
+```
+
+- 服务端周期性发送 `{"type":"heartbeat"}`（间隔 `heartbeatMs`，默认 15000），
+  用于穿透中间代理的空闲超时并让 IM 侧判断链路是否存活。
+- IM 侧**禁止**使用浏览器原生 `EventSource`（无法设置 `Authorization` 头）。
+  用 `aiohttp` 手动读流。
+
+### 3.3 `POST /approval` — 回执一个待审批请求
+
+请求：
+
+```jsonc
+{
+  "conversation": "default:GroupMessage:123456",
+  "callId": "call_9f2a",
+  "outcome": "allowed-once",     // allowed-once | rejected
+  "code": "K7Q2"                 // 见 §7，必须与 approval/required 下发的 code 一致
+}
+```
+
+响应 `200`：`{ "ok": true }`；`409` 表示该 `callId` 已决议或已超时（幂等冲突，
+不视为错误，IM 侧只提示用户）。
+
+### 3.4 `GET /health` — 存活与版本协商
+
+```jsonc
+{
+  "ok": true,
+  "bridgeVersion": "1",
+  "dshVersion": "0.1.5-rc.2",
+  "uptimeMs": 123456,
+  "conversations": 3
+}
+```
+
+IM 侧启动时与周期性（`healthIntervalMs`）调用。`bridgeVersion` 不匹配时
+**拒绝启用桥接并明确报错**，不做猜测性降级。
+
+---
+
+## 4. 事件类型清单（下行，`/events`）
+
+| `type` | 载荷 | DSH 侧来源【已证实】 |
+|---|---|---|
+| `turn/start` | `turn` | `session/event` → `turn/start` |
+| `text/delta` | `text` | `agent/assistant-stream` → `frame.chunk.type === 'text-delta'` |
+| `reasoning/delta` | `text` | 同上 → `'reasoning-delta'`（受 `forwardReasoning` 配置控制，默认关） |
+| `tool/call` | `callId`, `name`, `argsPreview` | `agent/assistant-stream` → `'tool-call-delta'` 聚合后 |
+| `approval/required` | `callId`, `code`, `toolName`, `reason`, `expiresAt` | `approval/request` waterfall |
+| `approval/resolved` | `callId`, `outcome` | 同上，决议后回填 |
+| `message/final` | `text` | `session/event` → `assistant/message`（**权威最终文本**） |
+| `turn/end` | `reason: { kind, error? }` | `session/event` → `turn/end` |
+| `heartbeat` | — | 插件自建定时器 |
+| `gap` | `fromSeq` | 环形缓冲溢出时 |
+
+### 4.1 三条实现约束（来自核实结论，写错就废）
+
+1. **`text/delta` 是瞬时事件，不属于会话历史。** 它由 `agent/assistant-stream`
+   发出，进程内可见；一旦没有订阅者就永久丢失。因此 `/events` **必须在投递消息
+   之前建立**，否则开头几个 token 会丢。IM 侧的顺序固定为：先连 SSE → 再 POST
+   `/message`。
+2. **事件是 `Scoped<Agent>` 派发，但未打 tag 的根 ctx 监听者会收到所有 agent 的
+   事件**【已证实：`dsh-scope` 的 `if (tag === void 0) return true`】。DSH 侧插件
+   **必须**自己在回调里按 `agent.id` / `session.id` 过滤到本插件创建的会话，
+   否则会串台到用户自己在 Web UI 里的会话。
+3. **`reasoning/delta` 与 `tool-call-delta` 不含在 `assistant/message` 里**，
+   最终文本一律以 `message/final` 为准；`text/delta` 只用于「边跑边显示」，
+   不得作为最终回复拼接（多 step 任务会重复叠加）。
+
+---
+
+## 5. 鉴权与安全
+
+目标部署是**跨机/容器**，因此本节的每一项都是必需项，不是加固项。
+
+### 5.1 传输
+
+- 默认要求 **HTTPS**。明文 HTTP 仅在配置显式设置 `allowInsecureHttp: true`
+  时允许，且启动时打印 warning。
+- 契约不规定证书校验的绕过方式；如需自签证书，由 IM 侧配置
+  `caBundlePath` 指定 CA，**不允许**全局关闭校验。
+
+### 5.2 凭据
+
+- 共享密钥（`token`）：至少 32 字节随机值，两侧配置文件各自持有，**不进日志**。
+  IM 侧对应 `_conf_schema.json` 中 `"secret": true`（只做界面遮罩，不是加密）。
+- 校验方式：`Authorization: Bearer <token>`，DSH 侧**定长比较**（timing-safe），
+  失败一律 `401`，且**不区分**「token 错」与「token 缺失」的响应体。
+- 可选强化 `authMode: "hmac"`：额外要求
+  `X-Bridge-Signature: sha256=<hmac_sha256(token, ts + "." + rawBody)>` 与
+  `X-Bridge-Timestamp`，服务端拒绝偏离本地时钟超过 `signatureSkewMs`
+  （默认 60000）的请求。**v1 默认只用 Bearer**，HMAC 留作配置开关。
+
+### 5.3 威胁模型（明确写下来的部分）
+
+| 威胁 | 对策 |
+|---|---|
+| 网络嗅探 | HTTPS；token 不入日志 |
+| 重放 `/message` | `Idempotency-Key` + 幂等表 |
+| 重放 `/approval` | `code` 一次性 + `callId` 决议后失效 + 短 TTL |
+| 伪造审批（第三方冒充群成员） | 审批 `code` 只发给**发起该 turn 的 conversation**，且要求回执来自**同一 conversation**；`outcome` 只接受白名单值 |
+| 恶意 DSH 输出注入 IM 指令 | IM 侧发送前**不做**任何指令解析；输出一律当纯文本 |
+| 拒绝服务（刷消息） | 每 conversation 有界队列 + `429`（§6.3） |
+| 越权触碰用户自己的 DSH 会话 | 插件只操作自己创建的 `agent` 句柄，按 `agent.id` 过滤；不提供任何「按 sessionId 任意操作」的端点 |
+
+**明确的非目标**：本文档不提供多租户隔离。一个 token 对应一套 IM→DSH 的信任域，
+不同 IM 群共享同一个 token。需要隔离时部署两套。
+
+---
+
+## 6. 幂等、重试与背压
+
+### 6.1 幂等
+
+- `/message` 的 `Idempotency-Key` 是**强制**的。服务端维护有界 LRU
+  （`idempotencyEntries`，默认 512 条，TTL `idempotencyTtlMs`，默认 10 分钟）：
+  命中则原样返回首次的 `202` 响应体并置 `duplicate: true`。
+- 幂等表**只覆盖 `/message`**。`/approval` 的重复提交由「已决议」语义吸收
+  （`409`）。
+
+### 6.2 重试
+
+- IM 侧对 `/message` 的重试**必须复用同一个 `Idempotency-Key`**；换 key 重试
+  等于第二条消息，是 bug。
+- 可重试：连接错误、超时、`502/503/504`、`429`。
+- 不可重试：`400/401/403/404/409`（含 `/approval` 的 `409`）。
+- 退避：指数退避 + 抖动，上限 `retryMaxDelayMs`（默认 30000），总次数
+  `retryMaxAttempts`（默认 5）。
+- **SSE 重连不算失败**：按 §3.2 带 `Last-Event-ID` 续传，退避从 1s 起。
+
+### 6.3 背压
+
+- DSH 侧每 conversation 一个**有界**队列（`maxQueuedPerConversation`，默认 4）。
+- 队满时 `/message` 返回 `429` + `Retry-After`，响应体
+  `{"error":{"code":"queue_full","message":"..."}}`。
+- IM 侧收到 `429` 时**必须**立即回一句「排队中，请稍候」并**不重试**
+  （重试只会加剧拥塞）；由用户后续消息触发新的尝试。
+- 另有一条硬闸：`agent.followup` 在 turn 运行中投递是排队的，但 IM 侧仍需保证
+  同一 conversation 同时只有一个在途 `/message`（客户端侧串行化），避免依赖
+  服务端队列语义。
+
+---
+
+## 7. 审批契约（设计第 4 层的落地形态）
+
+### 7.1 流程
+
+```
+DSH 内 agent 触发敏感工具
+  → 插件收到 'approval/request' waterfall（签名 (req, next) => Promise<Outcome>）【已证实】
+  → 插件生成 4 位一次性 code，记入 pending 表（含 callId / expiresAt / 期望 conversation）
+  → 通过该 conversation 的 SSE 发 approval/required
+  → IM 侧向用户展示：「需要审批：<toolName> <reason>，回复 /dsh approve <code> 或 /dsh reject <code>」
+  → 用户回复 → IM 侧 POST /approval
+  → 插件校验 code + conversation + 未过期 + 未决议 → resolve waterfall
+  → SSE 发 approval/resolved
+```
+
+### 7.2 硬性约束
+
+1. **必须自加超时**。审批服务自身**没有任何超时**【已证实】；唯一的取消来源是
+   `req.signal`。没有 IM 回执就会**永久堵住该 turn**。超时后 resolve
+   `'rejected'`（fail closed，不是 `'cancelled'`——`'cancelled'` 语义是用户/上游
+   取消，会被误当成正常中止）。超时值 `approvalTimeoutMs`，默认 120000。
+2. **`req.signal` 的 abort 必须转成 `'cancelled'`**，并清理 pending 表与定时器，
+   否则泄漏。
+3. **审计约束**：`approval/asked` 与 `approval/decided` 会话事件必须包在
+   **已开启的 turn** 内，否则 DSH 直接抛错【已证实】。这意味着审批**不能**在
+   turn 之外（例如插件自发的后台动作）发起。
+4. **`outcome` 白名单**：`allowed-once` / `rejected`。DSH 侧完整枚举是
+   `allowed-once | rejected | cancelled | unavailable`，但网桥**只暴露前两个**给
+   IM，其余两个是系统语义，不应由 IM 用户触发。
+5. **只接受同 conversation + 明确命令**。不接受纯粹的「是/否」自然语言
+   （易被同群他人误触发）。这是原始设计里一次性验证码思路的保留。
+
+### 7.3 提问（`user-questions/request`）
+
+同为 waterfall，返回 `AskUserQuestionAnswer`【已证实签名】。v1 **不实现**，
+原因：交互式多选题在 IM 里的降级形态需要单独设计（编号回复、多轮澄清），
+且不是用户原始五层设计的必需项。列入 §9 未决。
+
+---
+
+## 8. 错误模型
+
+统一响应体：
+
+```jsonc
+{ "error": { "code": "queue_full", "message": "会话队列已满", "details": {...} } }
+```
+
+| code | HTTP | 含义 | IM 侧行为 |
+|---|---|---|---|
+| `unauthorized` | 401 | token 缺失/错误 | 不重试，明确报错到日志，桥接置为不可用 |
+| `not_found` | 404 | conversation 无映射（且 policy 不允许自动建） | 提示用户先触发一次会话建立 |
+| `queue_full` | 429 | 队列满 | 回「排队中」，不重试 |
+| `agent_busy` | 409 | 同 conversation 已有在途 turn 且策略不允许排队 | 提示「正在处理上一条」 |
+| `unsupported` | 400 | 未知 `type` / 不支持的字段组合 | 记日志，回执给用户 |
+| `internal` | 500 | DSH 内部错误 | 可重试一次，然后向用户报错 |
+
+**错误必须响亮**（沿用 DSH 的设计原则）：配置非法时 DSH 侧插件**加载即失败**
+（Schemastery `required()`），而不是运行期静默降级。
+
+---
+
+## 9. 未决问题（实现前必须收敛）
+
+| # | 问题 | 影响 | 收敛方式 |
+|---|---|---|---|
+| 1 | DSH 侧插件卸载时的收尾顺序：`agent.cancel({kind:'user'})` → `await agent.whenIdle()` → `ctx.sessions.flush()` → `dispose()` 是否在所有中断路径下都安全？ | 卸载残留可能丢消息 | 在真实 DSH 上实测（P1） |
+| 2 | `ctx.agents.create` 需要 `agentOptions: {provider, model}`，而模型选择是否需要插件自己安装（`installModelSelection` / `agentPresets.mount` / 自建 `agent/request` hook 三条路）**未实测对比** | 不装则可能拿不到默认模型 | P1 实测三选一 |
+| 3 | 新装插件是否免重启生效（HMR）**未验证** | 影响部署流程 | P1 实测 |
+| 4 | SSE 经反向代理（nginx/traefik）时的缓冲与超时行为 | 跨机部署的常见坑 | 部署时验证 `proxy_buffering off` + `heartbeatMs` |
+| 5 | 消息长度上限按目标平台取值：aiocqhttp 无任何切分【已证实】，且走 `yield` 时纯文本 > 1500 会被自动包成合并转发 `Node` | 影响第 5 层切分策略 | 按目标平台写死默认值 + 配置覆盖 |
+| 6 | 是否实现 `user-questions/request` 转发 | 功能完整性 | 二期决定 |
+| 7 | 是否把 `astrbot_plugin_dsh_connector` 的能力（多会话管理、模型/preset 切换、Settings、图片卡）合并进新插件，还是新插件只做桥接最小集 | 工作量差异巨大 | 需要你决策（见 DESIGN.md §7） |
+
+---
+
+## 10. 版本协商
+
+- 契约版本号 `bridgeVersion = "1"`，随每次破坏性变更递增。
+- `/health` 返回 `bridgeVersion`；IM 侧启动时校验，不等则拒绝启用。
+- 契约内新增**可选**字段不递增版本（归入前向兼容规则）；新增事件 `type`
+  不递增（客户端忽略未知 `type`）；修改既有字段语义**必须**递增。
+
+---
+
+## 11. 控制面转发（v1.1 草案）
+
+> **数据面**（§3）与**控制面**（本节）是两条独立通道：数据面服务于
+> 「一条 IM 消息 → 一次 agent 执行」；控制面服务于 connector 原有的管理能力
+> （会话 / 模型 / Preset / 权限 / Settings / Skills / Subagents / Goals /
+> Workspaces）。本节是 P5 的契约。
+>
+> 背景与可行性证据：`docs/control-plane-transport.md`；
+> 落地要求与权限模型：`docs/DESIGN.md` §7.3 / §7.3.1。
+
+### 11.1 端点
+
+`POST /rpc`
+
+```jsonc
+{ "endpoint": "session/list", "args": { "_request": {} } }
+```
+
+必填请求头同 §5（`Authorization: Bearer <token>`）。响应**直接返回 DSH 网关的
+`result` 对象**，与浏览器 `/api` 逐字段同构：
+
+```jsonc
+{ "ok": true, "value": { "items": [ /* ... */ ] } }
+```
+
+- 业务失败：`{"ok": false, "error": {...}}`，HTTP 仍为 **200**（与 DSH 网关行为一致，
+  IM 侧必须判 `ok` 而不是只看状态码）。
+- 鉴权失败：按 §8 统一错误体返回 `401`。
+- `endpoint` 不在白名单：按 §8 返回 `403` + `code: "forbidden"`（**新增错误码**）。
+
+### 11.2 为什么是"转发"而不是"逐方法重建"
+
+DSH 侧在进程内通过 `ctx.connection.createSharedFetchHandler('/api')` 把请求派发给
+既有 host RPC，好处是：
+
+- 不必为 28 个能力各写一条类型化路由；
+- DSH 升级导致的签名漂移只需改 AstrBot 侧的映射表；
+- IM 侧与 Web UI 看到的是**同一份真相**，不会出现两套语义。
+
+端点的线上形状是 **`<namespace>/<method>`（恰好两段）**，载荷是 **`{args:{...}}`**
+（`claimsEndpoint` 强制 `split("/").length === 2`）。**点号写法（`session.list`）
+在当前 DSH 上 33/33 全部 404**，不得使用。
+
+### 11.3 三条硬约束
+
+1. **方法白名单是强制的，不是加固。** 转发等于把整个 `/api` 面交给 IM；
+   没有白名单就是提权路径。写类方法（`settings/mutate`、`workspace/archiveSession`
+   等）默认**关闭**，按需显式开启。
+2. **流式控制面端点必须走 `ctx.typertGateway.stream(...)`**，不能走
+   `createSharedFetchHandler` 的 `fetch`（实机：`/api/workspace/follow` 经 invoke
+   会 `gateway/signature-invalid`）。**v1 不暴露任何流式控制面端点。**
+3. **`host.describe` / `workspace.list` / `goals/blocked` 不存在**（实机 404，
+   是真实缺失而非拼写错误），**不得写入白名单**。等价信息按 `DESIGN.md` §7.3 的
+   替代方案获取。
+
+### 11.4 尚未实测（P1 阻塞项）
+
+- **`session/page` 的必填 `throughSeq` 语义未实测**，而 connector 的整个回复等待
+  循环压在 `session/history` 上 → **P1 必须先实测一次**。候选来源：
+  `session/list` 的 `projections.asOfSeq`。
+- 进程内直调、`fetch.register` 的 SSE、exact 路由抢占目前**只有静态证据**
+  （需装插件并重启 harness 才能实跑）。

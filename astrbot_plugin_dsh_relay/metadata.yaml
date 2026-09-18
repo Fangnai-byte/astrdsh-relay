@@ -1,0 +1,22 @@
+name: astrbot_plugin_dsh_relay
+display_name: 星驿 AstrDsh Relay
+short_desc: 把 IM 消息转成 DSH 会话执行，并回传流式输出与审批请求
+desc: >-
+  监听指定前缀的 IM 消息，通过带鉴权的 HTTP + SSE 通道投递给 DeepSeek Harness 的
+  dsh-astrbot-relay 插件；把流式文本节流回帖到同一会话，并把 DSH 的敏感操作审批请求
+  转成一次性验证码交用户确认。
+  与 astrbot_plugin_dsh_connector 的定位不同：本插件只做「消息桥接（数据面）」，
+  会话/模型/Preset/Settings 的管理面仍由 connector 负责。
+version: 0.1.0
+author: yourname
+repo: ''
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - qq_official
+tags:
+  - deepseek
+  - harness
+  - dsh
+  - bridge

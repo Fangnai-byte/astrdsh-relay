@@ -1,0 +1,33 @@
+# dsh-astrbot-relay — 组合包 patch 层
+#
+# 语义提醒（已核实）：
+#   - patch 是「按顶层 key 赋值」，写出的 config: 会**整体替换**目标行的 config，
+#     未写出的顶层 key 保留。
+#   - 因此下面是完整的 config，不是增量。
+#   - 用户可以在自己 profile 的 cordis.patch.yml 里覆盖本行，无需改动本包。
+#
+# token 与 cwd 属于部署取值，必须由用户覆盖，这里只给 schema 默认与占位。
+- insert:
+    - id: dsh-astrbot-relay
+      name: dsh-astrbot-relay
+      config:
+        # ---- 必填（Schemastery required()，缺失则插件加载即失败，不静默降级）----
+        token: ''          # 共享密钥，>=32 字节随机串；用容器 secret / 环境变量注入
+        cwd: ''            # agent 工作目录，必须是绝对路径
+        # ---- 传输 ----
+        pathPrefix: '/astrbot-relay'
+        heartbeatMs: 15000
+        eventBufferSize: 512
+        # ---- 会话映射 ----
+        statePath: ''      # 空 = <DSH_HOME>/astrbot-relay/state.json
+        policy: 'one-to-one'   # one-to-one | on-demand | daily
+        idleTtlMs: 86400000
+        # ---- 背压与幂等 ----
+        maxQueuedPerConversation: 4
+        idempotencyEntries: 512
+        idempotencyTtlMs: 600000
+        # ---- 审批 ----
+        approvalEnabled: true
+        approvalTimeoutMs: 120000   # 审批服务自身零超时，这里必须给值
+        # ---- 输出 ----
+        forwardReasoning: false

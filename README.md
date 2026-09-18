@@ -1,0 +1,73 @@
+# AstrDsh Relay（星驿）— IM ↔ DSH 网桥
+
+把 IM（QQ / Telegram 等，经 AstrBot）的消息桥接到 DeepSeek Harness 的 agent 会话，
+并把流式输出与**敏感操作审批请求**带回聊天窗口。
+
+| 名称 | 值 |
+|---|---|
+| 项目名 | **AstrDsh Relay** |
+| 中文代号 | **星驿** |
+| AstrBot 侧插件 | astrbot_plugin_dsh_relay |
+| DSH 侧插件 | dsh-astrbot-relay |
+
+> 本轮交付：**设计 + 契约 + 两侧骨架**。没有可运行实现。
+> 两个骨架里未完成的部位会明确返回"未实现"，不会假装成功。
+
+## 交付物地图
+
+| 文件 | 是什么 |
+|---|---|
+| `docs/BRIDGE-CONTRACT.md` | **接口契约 v1**。两侧唯一真相来源：拓扑、会话键、4 个端点、事件 schema、鉴权、幂等/重试/背压、错误模型、审批流程。 |
+| `docs/DESIGN.md` | **五层设计（核实修正版）**。含「原始设计假设 vs 源码事实」的 12 条差异修正表、分阶段计划、跨机部署清单、风险登记。 |
+| `docs/dsh-side-capabilities.md` | DSH 侧 API 核实报告（1590 行，逐条 `路径:行号` 证据）。 |
+| `docs/astrbot-side-capabilities.md` | AstrBot 侧 API 核实报告（1889 行，逐条证据）。 |
+| `docs/connector-surface.md` | 既有 connector 的**能力面清点**（替代方案的验收基线 + 迁移三分类）。 |
+| `docs/control-plane-transport.md` | 控制面传输可行性调研：能否在进程内调用/转发 DSH host RPC（决定替代成本）。 |
+| `.probe/probe-api.mjs` | 控制面调研的可复现**只读**探针脚本（自签 cookie 走 33 个 endpoint，验证点号写法全 404、斜杠写法 200）。 |
+| `docs/evidence/` | 实跑固化证据（`dsh --profile web --dump-config` 的实际层组合输出）。 |
+| `dsh-astrbot-relay/` | DSH 侧 host 插件骨架（`package.json` / `cordis.patch.yml` / `lib/contract.js` / `lib/index.js`）。 |
+| `astrbot_plugin_dsh_relay/` | AstrBot 侧 Star 插件骨架（`main.py` / `_conf_schema.json` / `metadata.yaml` / `contract.py`）。 |
+| `AstrBot插件开发指南总结.md` | 社区整理的 AstrBot 插件开发指南（参考资料，**非**本项目产出，部分条目与源码不符，见 DESIGN §1）。 |
+| `新建 文本文档.txt` | DSH 官方插件开发教程文本（参考资料，非本项目产出）。 |
+
+## 三个决定性结论（都改变了原始设计）
+
+1. **路线选 A**：AstrBot 侧普通 Star 插件，复用现有 IM 适配器。
+   `Platform` 基类只有 `run()` / `meta()` 两个抽象方法，`send_by_session()`
+   有默认实现（不实现不报错，但主动消息**静默发不出**）——所以根本不写 Platform。
+
+2. **传输不用现成的 `/api` RPC 面**，改为自建 DSH host 插件 + 自有鉴权路由 + SSE。
+   三条硬理由：`/api` 有 Host/Origin 栅栏 + 浏览器 cookie 鉴权（跨机非浏览器客户端
+   接不进去）；该面只能轮询 `session.history`；**审批只能在进程内拦截**。
+
+3. **`assistant/chunk` 在当前 DSH 版本已不存在**（v0 遗留）。流式要用
+   `agent/assistant-stream` 的 `text-delta`（瞬时事件，**必须先连 SSE 再投消息**），
+   最终文本用 `session/event` 的 `assistant/message`。
+
+## 下一步（P1）需要先实测三件事
+
+1. `@deepseek-ai/schemastery` / `@deepseek-ai/dsh-llm` 作为第三方插件依赖能否解析。
+2. `ctx.agents.create` 的模型选择装法（三条候选路径）。
+3. `agent/assistant-stream` 在真实运行进程里能否收到；插件是否免重启生效。
+
+## 目标：**最终替代** `astrbot_plugin_dsh_connector`
+
+用户已定：新插件 `astrbot_plugin_dsh_relay` **最终替代**既有的
+`astrbot_plugin_dsh_connector` v2.0.1（本机当前禁用的那个），不是并存、不是 fork。
+
+验收标准因此变成「**connector 的能力面被逐项覆盖或显式放弃**」：
+
+- 能力清点（验收基线）：`docs/connector-surface.md`
+- 迁移阶段与共存规则：`docs/DESIGN.md` §7（P5 控制面接管 / P6 退役）
+- 迁移分三类：**可直接搬**（呈现层、选项存储模型、测试基线）/
+  **必须重做**（依赖已删除的 `assistant/chunk`、依赖 `/api` 面的部分）/ **可放弃**
+- 迁移分布：**必须重做 12 条 / 可直接搬 10 条 / 可放弃 7 条**
+
+**决定性变量已收敛 → 管道式转发可行。** 第三方 host 插件在进程内按名调用既有
+host RPC 是**公开 API**（`ctx.connection.createSharedFetchHandler('/api')`），
+DSH 侧约 100 行即可转发，**不需要**逐方法重做那 28 个能力。但「AstrBot 侧只换
+base_url」被**实机推翻**：connector 的 33 个点号 endpoint **33/33 全部 404**，
+必须改成 `<namespace>/<method>` + `{args:{...}}`（业务字段却逐字段一致，所以改动
+是机械的）。代价是**把整个 `/api` 面暴露给 IM**，因此强制方法白名单 + ADMIN
+权限门成了必做项，不是加固项。结论见 `docs/control-plane-transport.md`，
+落地要求见 `docs/DESIGN.md` §7.3 / §7.3.1。

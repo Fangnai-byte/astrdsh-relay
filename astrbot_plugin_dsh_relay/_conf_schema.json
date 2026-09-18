@@ -1,0 +1,114 @@
+{
+  "enable": {
+    "description": "启用桥接",
+    "type": "bool",
+    "default": true
+  },
+  "bridge_url": {
+    "description": "DSH 网桥基址",
+    "type": "string",
+    "default": "http://127.0.0.1:3080/astrbot-relay",
+    "hint": "指向 dsh-astrbot-relay 插件的 pathPrefix。跨机部署时写 DSH 的对外可达地址，不要写 127.0.0.1"
+  },
+  "bridge_token": {
+    "description": "共享密钥（与 DSH 侧 token 一致）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "至少 32 字符。只做界面遮罩，不是加密；请勿复用其它服务的密钥"
+  },
+  "allow_insecure_http": {
+    "description": "允许明文 HTTP",
+    "type": "bool",
+    "default": false,
+    "hint": "仅在受信内网/同机调试时开启；开启后启动时打印 warning"
+  },
+  "ca_bundle_path": {
+    "description": "自签证书的 CA 路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空则使用系统信任库。禁止全局关闭证书校验"
+  },
+  "trigger_prefix": {
+    "description": "触发前缀",
+    "type": "string",
+    "default": "/dsh ",
+    "hint": "注意 AstrBot 本机 wake_prefix 为 \"/\"，前缀不要与之冲突"
+  },
+  "allow_from": {
+    "description": "会话白名单（UMO 列表，空=全部允许）",
+    "type": "list",
+    "default": [],
+    "hint": "填 unified_msg_origin，形如 default:GroupMessage:123456"
+  },
+  "reply_in_private_only": {
+    "description": "仅在私聊响应",
+    "type": "bool",
+    "default": false
+  },
+  "request_timeout": {
+    "description": "单次 HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "connect_timeout": {
+    "description": "连接超时（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "health_interval_ms": {
+    "description": "健康检查间隔（毫秒，0=关闭）",
+    "type": "int",
+    "default": 30000
+  },
+  "stream_enabled": {
+    "description": "流式回帖",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后等 message/final 一次性发送（更省消息条数，但等待期间无反馈）"
+  },
+  "throttle_ms": {
+    "description": "流式合流窗口（毫秒）",
+    "type": "int",
+    "default": 2500
+  },
+  "flush_chars": {
+    "description": "流式合流字符阈值",
+    "type": "int",
+    "default": 200
+  },
+  "chunk_size": {
+    "description": "单条消息最大字符数（0=不切分）",
+    "type": "int",
+    "default": 800,
+    "hint": "aiocqhttp 适配器没有任何长度切分逻辑，必须在此切分；走 yield 时纯文本超过 forward_threshold(本机 1500) 会被自动包成合并转发"
+  },
+  "reply_render_mode": {
+    "description": "回复呈现方式",
+    "type": "string",
+    "default": "text",
+    "options": ["text", "card"],
+    "hint": "text=纯文本并对 Markdown 做最小降级；card=交给 AstrBot t2i 渲染成图片卡"
+  },
+  "approval_enabled": {
+    "description": "转发敏感操作审批请求",
+    "type": "bool",
+    "default": true
+  },
+  "approval_timeout_ms": {
+    "description": "审批等待超时（毫秒）",
+    "type": "int",
+    "default": 120000,
+    "hint": "应与 DSH 侧 approvalTimeoutMs 一致或略小；超时按拒绝处理（fail closed）"
+  },
+  "retry_max_attempts": {
+    "description": "可重试错误的尝试次数",
+    "type": "int",
+    "default": 5
+  },
+  "retry_max_delay_ms": {
+    "description": "重试最大退避（毫秒）",
+    "type": "int",
+    "default": 30000
+  }
+}
