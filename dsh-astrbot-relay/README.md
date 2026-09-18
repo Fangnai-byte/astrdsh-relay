@@ -19,10 +19,12 @@ DeepSeek Harness 的 **IM 网桥 host 半边**。它把「IM 前端（AstrBot）
 | 路由注册 + 失败降级为 no-op + effect 清理 | ✅ 就位 |
 | Bearer 鉴权（定长比较） | ✅ 就位 |
 | 契约常量（`lib/contract.js`） | ✅ 就位 |
-| `GET /health` | ✅ 就位 |
+| `GET /health`（含 cwd/statePath 等定位诊断） | ✅ 就位 |
+| `GET /where`、`GET /conversations`（定位，契约 §12） | ✅ 就位 |
+| 会话标题渲染 + `state.json` 原子读写 | ✅ 就位 |
 | `POST /message`、`GET /events`（SSE）、`POST /approval` | ⛔ TODO（P1/P2） |
 | agent 会话驱动、事件转发、审批 waterfall、幂等/背压/环形缓冲 | ⛔ TODO |
-| 映射持久化 `state.json`（原子写） | ⛔ TODO |
+| 映射的**写入**路径（建立/回收会话时落盘） | ⛔ TODO（P1；读取已就位） |
 
 ## 为什么不用现成的 `/api/<method>` RPC 面
 

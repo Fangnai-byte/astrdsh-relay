@@ -28,6 +28,8 @@ NotImplementedError`，命中时回复明确的「骨架未实现」提示，不
 | 切分回帖结构（中间分片 `event.send()` / 最后一片 `yield`） | ✅ 结构就位（切分算法是占位） |
 | 审批命令分支（`/dsh approve|reject <code>`） | ✅ 结构就位 |
 | 契约常量（`contract.py`） | ✅ 就位 |
+| `/dsh where` 定位命令 + 本地信息（会话键/桥接地址） | ✅ 就位 |
+| 定位结果排版（`location_text.py`） | ✅ 就位（有单测） |
 | HTTP + SSE 传输层 | ⛔ TODO（P1/P2） |
 | 流式节流、幂等键复用、重试退避、health 轮询 | ⛔ TODO |
 | 主动推送 `push_to_session` | ⛔ TODO（P3，需先确认 `MessageChain` 导入路径） |

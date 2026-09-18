@@ -432,3 +432,111 @@ DSH 侧在进程内通过 `ctx.connection.createSharedFetchHandler('/api')` 把�
   `session/list` 的 `projections.asOfSeq`。
 - 进程内直调、`fetch.register` 的 SSE、exact 路由抢占目前**只有静态证据**
   （需装插件并重启 harness 才能实跑）。
+---
+
+## 12. 定位与来源标注（v1.1 草案）
+
+> 回答两个问题：**这个 IM 对话落在哪个工作区**、**它对应哪个 DSH 会话**；
+> 并提供反向抓手——**DSH 会话标题里带来源**，便于在 DSH Web UI 的会话列表里
+> 认出「哪条来自哪个群」。
+>
+> 本节的读路径**不依赖任何未核实的 DSH API**，因此已经是可用的实现；
+> 只有「标题的应用」与「对话级覆盖的写入」留给 P1 / P5。
+
+### 12.1 `GET /where?conversation=<umo>`
+
+请求头同 §5。响应 `200`：
+
+```jsonc
+{
+  "conversation": "default:GroupMessage:1000000001",
+  "found": true,                                       // 是否已有映射记录
+  "sessionId": "im-3f9a1c7e-...",                      // 无则 null
+  "title": "星驿 · default/GroupMessage/1000000001",    // 反向定位用：DSH 会话标题
+  "cwd": "D:\\AI\\workspace",
+  "workspaceId": null,
+  "source": "conversation",                            // conversation | global | none
+  "policy": "one-to-one",
+  "createdAt": 1700000000000,
+  "lastActiveAt": 1700000000000,
+  "seq": 42,
+  "statePath": "C:\\Users\\<user>\\.dsh\\astrbot-relay\\state.json"
+}
+```
+
+两条硬要求：
+
+1. **`found: false` 时仍要作答。** 会话还没建立映射时，`cwd` 与 `source` 依然要给出——
+   它回答的是「**将会**落在哪」，而这正是排查时最想知道的事。
+2. **`source` 必须如实反映来源。** 用户要能区分「这个目录是给本对话单独配的，
+   还是全局默认」；混作一谈会让「为什么这个群跑在别的目录」变得无法解释。
+
+`conversation` 缺失 → `400` + `unsupported`。
+
+### 12.2 `GET /conversations?limit=N`
+
+列出已知映射。`limit` 默认 50、上限 200；超出即**钳制**（不报错），
+返回体里带 `limit` 说明实际生效值：
+
+```jsonc
+{ "count": 2, "returned": 2, "limit": 50, "items": [ /* 同 §12.1 的结构 */ ] }
+```
+
+### 12.3 工作目录的解析顺序
+
+**对话级覆盖 → 全局配置 → 无。**
+
+| 命中 | `source` |
+|---|---|
+| 记录里有 `cwd` 或 `workspaceId` | `conversation` |
+| 否则用插件全局 `cwd` | `global` |
+| 两处都没有 | `none`（由调用方决定是否报错；本版只如实呈现） |
+
+对话级覆盖存放在 `state.json` 的记录里（`cwd` / `workspaceId`）。
+**写入路径留给 P5 控制面**——在权限模型（§7.3.1）就位之前不开写面。
+因此 §12 在当前版本是**只读**的：要按对话区分目录，可以直接人工编辑 `state.json`。
+
+### 12.4 反向定位：DSH 会话标题
+
+会话标题由配置项 `sessionTitleTemplate` 渲染，占位符：
+
+`{platform}` `{messageType}` `{sessionId}` `{conversation}`
+
+默认值 `星驿 · {platform}/{messageType}/{sessionId}`，例如
+`星驿 · default/GroupMessage/1000000001`。用户在 DSH Web UI 的会话列表里
+按这个标题就能认出对应哪个群。
+
+- **未知占位符原样保留**（不替换成空串），让配置写错看得见，而不是静默产出空标题。
+- 标题为空等于定位失效，因此配置校验把「空模板 / 渲染结果为空」当**加载期错误**。
+- 标题的**应用**（在 `agents.create` 时写入，或事后重命名）属于 P1：
+  进程内等价 API 尚未核实，见 §11.4。
+
+### 12.5 `state.json`
+
+```jsonc
+{
+  "version": 1,
+  "conversations": {
+    "default:GroupMessage:1000000001": {
+      "sessionId": "im-...", "cwd": null, "workspaceId": null,
+      "policy": "one-to-one", "createdAt": 0, "lastActiveAt": 0, "seq": 0
+    }
+  }
+}
+```
+
+- 默认路径 `<DSH_HOME>/astrbot-relay/state.json`；`statePath` 可覆盖，**必须是绝对路径**。
+- **原子写**：写同目录临时文件再 `rename`（直接覆写在崩溃时会留下半截 JSON，
+  而那正好会触发下面这条「拒绝加载」）。
+- **解析失败必须响亮失败**：坏 JSON / `version` 不符 / 结构不对 → 插件**加载即失败**，
+  **绝不静默重建**。静默重建会把所有 IM 会话重新挂到新 DSH 会话上，丢掉历史。
+- `version` 不符一律拒绝，不做迁移猜测。
+- 记录按会话键**排序**写出，使人编辑与 `git diff` 稳定。
+
+### 12.6 鉴权口径的更正：`/health` 也要求鉴权
+
+§3 的「所有端点都要求鉴权」在本版**包括 `/health`**。
+骨架早期把 `/health` 做成了裸端点，现予更正——它现在返回 `cwd`、`statePath`、
+`sessionTitleTemplate` 这类本机部署信息，裸奔等于把这些细节送给任何能连到端口的人。
+`/health` 的定位诊断字段：`pathPrefix`、`cwd`、`statePath`、`stateExisted`、
+`policy`、`sessionTitleTemplate`、`conversations`（映射条数）。

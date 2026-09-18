@@ -23,18 +23,25 @@ jobs:
         with:
           python-version: '3.12'
 
-      # DSH 侧骨架是纯 ESM JS，只需语法可解析即可被 cordis 加载
+      # DSH 侧是纯 ESM JS，只需语法可解析即可被 cordis 加载
       - name: DSH 侧 JS 语法
-        run: |
-          node --check dsh-astrbot-relay/lib/index.js
-          node --check dsh-astrbot-relay/lib/contract.js
+        run: for f in dsh-astrbot-relay/lib/*.js; do node --check "$f"; done
 
       # AstrBot 侧骨架不 import astrbot，因此 py_compile 不需要装依赖
       - name: AstrBot 侧 Python 语法
-        run: python -m py_compile astrbot_plugin_dsh_relay/main.py astrbot_plugin_dsh_relay/contract.py
+        run: |
+          python -m py_compile astrbot_plugin_dsh_relay/*.py
+          rm -rf astrbot_plugin_dsh_relay/__pycache__
 
-      - name: 两侧契约常量一致性（事件名/错误码/路由）
+      - name: 契约常量一致性（事件名/错误码/路由）
         run: node scripts/check-contract-parity.mjs
+
+      # 定位（契约 §12）：两侧的纯逻辑都有单测，且都不需要装 dsh/astrbot 依赖
+      - name: 定位逻辑单测（DSH 侧）
+        run: node scripts/test-location.mjs
+
+      - name: 定位排版单测（AstrBot 侧）
+        run: python scripts/test-location-text.py
 
       # 统一版本闸门：两侧版本号必须相等
       - name: 版本一致性

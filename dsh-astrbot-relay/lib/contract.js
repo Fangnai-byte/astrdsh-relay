@@ -13,10 +13,12 @@ export const BRIDGE_VERSION = '1'
 
 /** 路由。契约 §3。相对基址（AstrBot 侧配置项 bridge_url）。 */
 export const ROUTES = Object.freeze({
-  MESSAGE: '/message',    // POST  投递用户消息（要求 Idempotency-Key）
-  EVENTS: '/events',      // GET   SSE 下行通道（支持 Last-Event-ID 续传）
-  APPROVAL: '/approval',  // POST  回执审批
-  HEALTH: '/health',      // GET   存活与版本协商
+  MESSAGE: '/message',              // POST  投递用户消息（要求 Idempotency-Key）
+  EVENTS: '/events',                // GET   SSE 下行通道（支持 Last-Event-ID 续传）
+  APPROVAL: '/approval',            // POST  回执审批
+  HEALTH: '/health',                // GET   存活与版本协商
+  WHERE: '/where',                  // GET   定位：某对话 → 工作区 / DSH 会话（契约 §12）
+  CONVERSATIONS: '/conversations',  // GET   列出已知的对话映射（契约 §12）
 })
 
 /** 下行事件类型。契约 §4。 */

@@ -36,8 +36,10 @@ from astrbot.api.star import Context, Star
 
 try:  # 包内导入（正常安装路径）
     from . import contract
+    from . import location_text
 except ImportError:  # 直接以模块方式加载时的兜底，与同路线既有插件一致
     import contract  # type: ignore[no-redef]
+    import location_text  # type: ignore[no-redef]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -66,6 +68,15 @@ class BridgeTransport:
     async def health(self) -> dict[str, Any]:
         """``GET /health``；启动时校验 ``bridgeVersion``，不匹配则拒绝启用。"""
         raise NotImplementedError("P1: GET /health 尚未实现")
+
+    async def where(self, *, conversation: str) -> dict[str, Any]:
+        """``GET /where``：定位该对话的工作区与 DSH 会话（契约 §12）。
+
+        TODO(P1)：随传输层一起实现。返回结构见契约 §12.1；
+        排版已由 ``location_text.format_location`` 完成并有单测覆盖，
+        所以传输层一通，这条命令立刻可用。
+        """
+        raise NotImplementedError("P1: GET /where 尚未实现")
 
     async def send_message(
         self,
@@ -147,13 +158,22 @@ class Main(Star):
         if not command:
             yield event.plain_result(
                 f"用法：{prefix}<内容>　|　审批：{prefix}"
-                f"{contract.APPROVAL_COMMAND_APPROVE} <验证码>"
+                f"{contract.APPROVAL_COMMAND_APPROVE} <验证码>　|　定位："
+                f"{prefix}{contract.COMMAND_WHERE}"
             )
             event.stop_event()  # 必须在 yield 之后
             return
 
-        # 审批回执走独立分支：它不是对话内容，不能投给 agent。
         head = command.split(maxsplit=1)[0].lower()
+
+        # 定位：只读诊断，不投给 agent。
+        if head == contract.COMMAND_WHERE:
+            async for result in self._handle_where_command(event):
+                yield result
+            event.stop_event()
+            return
+
+        # 审批回执走独立分支：它不是对话内容，不能投给 agent。
         if head in (contract.APPROVAL_COMMAND_APPROVE, contract.APPROVAL_COMMAND_REJECT):
             async for result in self._handle_approval_command(event, command):
                 yield result
@@ -197,6 +217,31 @@ class Main(Star):
         # TODO(P1) 这里等 SSE 上的 message/final 与 turn/end 收敛出最终文本，
         # 然后交给 `self._reply(event, final_text)` 回帖（切分与分片策略已就位）。
         yield event.plain_result("[星驿 骨架] 传输层未实现，未收到回复。")
+
+    async def _handle_where_command(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """``/dsh where`` —— 定位当前对话的工作区与 DSH 会话（契约 §12）。
+
+        设计取舍：**本地那几行永远打印**。因为用户问「我在哪」时最需要的信息
+        （会话键、桥接地址）本来就在本地，不该被一次网络往返的失败拖没——
+        插件刚装、地址填错、桥接端没起，这些恰恰是最需要定位能力的时刻。
+        """
+        lines = location_text.format_where_header(
+            event.unified_msg_origin,
+            str(self._cfg("bridge_url", "") or ""),
+        )
+        try:
+            info = await self._transport_or_create().where(
+                conversation=event.unified_msg_origin
+            )
+        except NotImplementedError as exc:
+            lines.append(f"· 桥接端：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 定位失败不应影响插件
+            logger.warning(f"[dsh_relay] 定位查询失败：{exc}")
+            lines.append(f"· 桥接端查询失败：{exc}")
+        else:
+            lines.extend(location_text.format_location(info))
+
+        yield event.plain_result("\n".join(lines))
 
     async def _handle_approval_command(
         self, event: AstrMessageEvent, command: str

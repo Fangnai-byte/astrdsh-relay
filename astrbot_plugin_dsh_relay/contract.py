@@ -15,6 +15,9 @@ ROUTE_MESSAGE = "/message"
 ROUTE_EVENTS = "/events"
 ROUTE_APPROVAL = "/approval"
 ROUTE_HEALTH = "/health"
+#: 定位（契约 §12）：某对话 → 工作区 / DSH 会话。
+ROUTE_WHERE = "/where"
+ROUTE_CONVERSATIONS = "/conversations"
 
 #: 下行事件类型。契约 §4。
 EVENT_TURN_START = "turn/start"
@@ -63,3 +66,7 @@ APPROVAL_OUTCOMES_ALLOWED = frozenset({APPROVAL_ALLOW_ONCE, APPROVAL_REJECTED})
 #: 审批命令关键字。契约 §7.2 第 5 条：只接受明确命令，不接受"是/否"。
 APPROVAL_COMMAND_APPROVE = "approve"
 APPROVAL_COMMAND_REJECT = "reject"
+
+#: 定位子命令。这是 **AstrBot 侧的 UX 词**，不是线上协议的一部分，
+#: 因此只存在于本文件（DSH 侧那份契约副本里没有对应常量）。
+COMMAND_WHERE = "where"

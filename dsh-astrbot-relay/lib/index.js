@@ -1,9 +1,10 @@
 /**
  * dsh-astrbot-relay（星驿）— IM ↔ DSH 网桥（DSH 侧 / host half）
  *
- * 这是**骨架**，不是实现：
- *   - 已就位：插件契约（name / inject / Config / apply）、配置校验、路由表、
- *     鉴权入口、清理路径、健康检查。
+ * 这是**骨架 + 已实现的只读部分**：
+ *   - 已实现：插件契约（name / inject / Config / apply）、配置与 state 校验、
+ *     路由表、Bearer 定长鉴权、健康检查、**定位（契约 §12）**、
+ *     会话标题渲染、state.json 的原子读写。
  *   - 未实现：会话驱动、事件转发、审批 waterfall、幂等/背压/环形缓冲。
  *     未实现处一律返回 501 并带明确的 TODO，**不会**假装成功。
  *
@@ -13,6 +14,7 @@
  *
  * 动笔前必读的三条已核实事实（写错就废）：
  *   1. `ctx.webServer.register` 注册的路由**没有任何鉴权**，必须自己实现（§5）。
+ *      因此**每个**端点（包括 /health）都要过 authorize。
  *   2. `text/delta` 来自 `agent/assistant-stream`，是**瞬时**事件，无订阅者即永久丢失
  *      → IM 侧必须先连 SSE 再 POST /message。
  *   3. 事件用 `Scoped<Agent>` 派发，但根 ctx 上未打 tag 的监听者会收到**所有** agent
@@ -26,6 +28,8 @@ import {
   BRIDGE_VERSION, ROUTES, ERROR_CODE, ERROR_STATUS, POLICY,
   APPROVAL_OUTCOME_ALLOWED, newSessionId,
 } from './contract.js'
+import { resolveLocation, renderSessionTitle } from './location.js'
+import { loadState, resolveStatePath, saveState } from './state.js'
 
 export const name = 'dsh-astrbot-relay'
 
@@ -55,11 +59,17 @@ export const Config = Schema.object({
   eventBufferSize: Schema.number().default(512),
   hmacMode: Schema.boolean().default(false),            // 可选强化，见契约 §5.2
 
-  // ---- 会话映射 ----
+  // ---- 会话映射与定位 ----
   statePath: Schema.string().default(''),              // 空 = <DSH_HOME>/astrbot-relay/state.json
   policy: Schema.union([POLICY.ONE_TO_ONE, POLICY.ON_DEMAND, POLICY.DAILY])
     .default(POLICY.ONE_TO_ONE),
   idleTtlMs: Schema.number().default(86_400_000),
+  /**
+   * DSH 会话标题模板——反向定位的抓手：标题里带上来源 IM 对话，
+   * 用户才能在 DSH Web UI 的会话列表里认出「哪条来自哪个群」。
+   * 占位符：{platform} {messageType} {sessionId} {conversation}
+   */
+  sessionTitleTemplate: Schema.string().default('星驿 · {platform}/{messageType}/{sessionId}'),
 
   // ---- 背压与幂等 ----
   maxQueuedPerConversation: Schema.number().default(4),
@@ -84,22 +94,14 @@ export function apply(ctx, config) {
   // 配置错误要响亮：宁可加载失败，也不要运行期静默降级。
   assertConfigIsUsable(config)
 
+  // state 在 apply 阶段就要定妥：路径非法或文件损坏都必须让**插件加载失败**，
+  // 而不是等到第一条消息进来才炸（契约 §2.2）。
+  const statePath = resolveStatePath(config.statePath)
+  const { records, existed: stateExisted } = loadState(statePath)
+
   ctx.inject(['webServer', 'agents', 'sessions'], (host) => {
     const log = host.logger ?? ctx.logger
     const tag = `[${name}]`
-
-    /**
-     * 运行时状态。实现阶段填充：
-     *   conversations: Map<conversationKey, {
-     *     dshSessionId, agent, seq, subscribers:Set<res>, buffer:[],
-     *     pending:Map<callId, {resolve, timer, code, expiresAt}>, queue:[],
-     *     seenIdempotencyKeys, lastActiveAt
-     *   }>
-     *
-     * 权威映射必须持久化到 config.statePath（原子写：tmp + rename），
-     * 启动解析失败时**拒绝启用**，不静默重建。契约 §2.2。
-     */
-    const conversations = new Map()
 
     // ────────────────────────────────────────────────────────────────
     // 路由表
@@ -111,6 +113,8 @@ export function apply(ctx, config) {
       { kind: 'exact', path: join(config.pathPrefix, ROUTES.MESSAGE), handler: handleMessage },
       { kind: 'exact', path: join(config.pathPrefix, ROUTES.EVENTS), handler: handleEvents },
       { kind: 'exact', path: join(config.pathPrefix, ROUTES.APPROVAL), handler: handleApproval },
+      { kind: 'exact', path: join(config.pathPrefix, ROUTES.WHERE), handler: handleWhere },
+      { kind: 'exact', path: join(config.pathPrefix, ROUTES.CONVERSATIONS), handler: handleConversations },
     ]
 
     ctx.effect(() => {
@@ -123,7 +127,10 @@ export function apply(ctx, config) {
           log?.warn?.(`${tag} 路由注册失败，已跳过 ${route.path}：${String(error)}`)
         }
       }
-      log?.info?.(`${tag} mounted at ${config.pathPrefix} (bridgeVersion=${BRIDGE_VERSION})`)
+      log?.info?.(
+        `${tag} mounted at ${config.pathPrefix} (bridgeVersion=${BRIDGE_VERSION})，` +
+        `state=${statePath}（${stateExisted ? `已载入 ${records.size} 条映射` : '新建'}）`,
+      )
       return () => {
         for (const dispose of disposers.reverse()) {
           try { dispose() } catch { /* 卸载期异常不得逃逸 */ }
@@ -137,7 +144,7 @@ export function apply(ctx, config) {
     //
     // TODO(P2) 流式：瞬时事件，逐 token。
     //   host.on('agent/assistant-stream', ({ agent, frame }) => {
-    //     const c = conversations.get(byAgentId(agent.id))   // ← 必须过滤，见文件头第 3 条
+    //     const c = runtime.get(byAgentId(agent.id))   // ← 必须过滤，见文件头第 3 条
     //     if (!c) return
     //     if (frame.type === 'start') { ... }
     //     if (frame.type === 'end')   { ... }
@@ -150,6 +157,7 @@ export function apply(ctx, config) {
     //   **不需要**再包一层 ctx.effect。
     //
     // TODO(P2) 持久事件：最终文本与 turn 边界。
+    //   const c = runtime.get(bySessionId(session.id))
     //   host.on('session/event', (session, event) => {
     //     if (event.type === 'assistant/message') push(c, { type: EVENT.MESSAGE_FINAL, ... })
     //     else if (event.type === 'turn/end')     push(c, { type: EVENT.TURN_END, ... })
@@ -161,7 +169,7 @@ export function apply(ctx, config) {
     //
     // TODO(P2) 审批 waterfall。
     //   host.on('approval/request', (request, next) => {
-    //     const c = conversations.get(byAgentId(request.agent.id))
+    //     const c = runtime.get(byAgentId(request.agent.id))
     //     if (!c || !config.approvalEnabled) return next()   // 不接管就让框架按默认策略处理
     //     return askApproval(c, request)
     //   })
@@ -179,13 +187,27 @@ export function apply(ctx, config) {
     // 路由实现
     // ────────────────────────────────────────────────────────────────
 
-    /** GET /health — 已实现（纯常量 + 内存计数，无未核实 API）。 */
+    /**
+     * GET /health — 存活、版本协商与非敏感定位概览。
+     *
+     * 契约 §3「通用要求：所有端点都要求鉴权」→ 这里也要过 authorize。
+     * （骨架早期版本把它做成了裸端点，本版修正：它现在会返回 cwd / statePath
+     *   这类本机路径信息，裸奔等于把部署细节送给任何能连到端口的人。）
+     */
     function handleHealth(request, response) {
+      if (!authorize(request, response, config)) return
       writeJson(response, 200, {
         ok: true,
         bridgeVersion: BRIDGE_VERSION,
         uptimeMs: Math.round(process.uptime() * 1000),
-        conversations: conversations.size,
+        conversations: records.size,
+        // 定位相关的诊断信息：让排查的人不必去翻配置文件
+        pathPrefix: config.pathPrefix,
+        cwd: config.cwd,
+        statePath,
+        stateExisted,
+        policy: config.policy,
+        sessionTitleTemplate: config.sessionTitleTemplate,
         // dshVersion 需要从 host.describe 之类的服务读取——【未核实】，
         // 实现阶段补上；契约允许字段缺失时由 IM 侧忽略。
       })
@@ -225,11 +247,68 @@ export function apply(ctx, config) {
         'POST /approval 尚未实现（P2）。骨架不假装成功。')
     }
 
-    log?.info?.(`${tag} loaded (skeleton)`)
+    /**
+     * GET /where?conversation=<umo> — **已实现**（契约 §12）。
+     *
+     * 只读地回答「这个 IM 对话落在哪个工作区、对应哪个 DSH 会话」。
+     * 会话尚未建立映射时也照样作答（found:false，但 cwd 与来源仍给出），
+     * 因为「它将会落在哪」正是排查时最想知道的事。
+     */
+    function handleWhere(request, response) {
+      if (!authorize(request, response, config)) return
+      const conversation = queryOf(request).searchParams.get('conversation')
+      if (!conversation) {
+        writeError(response, ERROR_CODE.UNSUPPORTED,
+          '缺少 conversation 查询参数（IM 会话键，形如 default:GroupMessage:1000000001）')
+        return
+      }
+      writeJson(response, 200, locationFor(conversation))
+    }
+
+    /**
+     * GET /conversations?limit=N — **已实现**（契约 §12）。
+     * 列出已知映射，默认 50 条、上限 200，避免一次拉爆。
+     */
+    function handleConversations(request, response) {
+      if (!authorize(request, response, config)) return
+      const raw = Number(queryOf(request).searchParams.get('limit') ?? 50)
+      const limit = Number.isFinite(raw) ? Math.min(Math.max(Math.trunc(raw), 1), 200) : 50
+      const items = [...records.keys()].sort().slice(0, limit).map((conversation) => locationFor(conversation))
+      writeJson(response, 200, { count: records.size, returned: items.length, limit, items })
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 定位与 state
+    // ────────────────────────────────────────────────────────────────
+
+    /** 组装某个会话的定位结果。工作目录顺序：对话级覆盖 → 全局配置。 */
+    function locationFor(conversation) {
+      return resolveLocation({
+        conversation,
+        record: records.get(conversation) ?? null,
+        globalCwd: config.cwd,
+        // P5 控制面才会引入全局 workspaceId 配置；现在恒为空。
+        globalWorkspaceId: '',
+        titleTemplate: config.sessionTitleTemplate,
+        statePath,
+      })
+    }
+
+    /**
+     * 落盘映射表（原子写）。P1 建立/回收会话时调用——
+     * 现在没有调用方，所以定位是**只读**的：state.json 可以人工编辑，
+     * 写入路径留给 P1，避免在权限模型（§7.3.1）就位前先开出写面。
+     */
+    function persistRecords() {
+      saveState(statePath, records)
+    }
+
+    log?.info?.(`${tag} loaded（定位已可用：GET ${config.pathPrefix}${ROUTES.WHERE}）`)
 
     // 供实现阶段使用的占位引用，避免 lint 报未使用。
     void randomUUID
     void newSessionId
+    void persistRecords
   })
 }
 
@@ -242,6 +321,11 @@ function join(prefix, path) {
   const left = String(prefix || '').replace(/\/+$/, '')
   const right = String(path || '').replace(/^\/+/, '')
   return `${left}/${right}`
+}
+
+/** 解析请求 URL 的查询串。node 的 http 请求不带 base，需要一个占位 origin。 */
+function queryOf(request) {
+  return new URL(request?.url ?? '/', 'http://astrbot-relay.internal')
 }
 
 /**
@@ -266,6 +350,14 @@ function assertConfigIsUsable(config) {
   if (config.pathPrefix.endsWith('/')) {
     throw new Error('dsh-astrbot-relay: pathPrefix 不要以 "/" 结尾（prefix 匹配会因此错位）')
   }
+  if (typeof config.sessionTitleTemplate !== 'string' || config.sessionTitleTemplate.trim() === '') {
+    throw new Error('dsh-astrbot-relay: sessionTitleTemplate 不能为空（它承担反向定位，空标题等于定位失效）')
+  }
+  // 渲染一次做冒烟：模板里未知占位符会原样保留，这里只保证渲染本身不抛错。
+  const probe = renderSessionTitle(config.sessionTitleTemplate, 'platform:MessageType:0')
+  if (probe.trim() === '') {
+    throw new Error('dsh-astrbot-relay: sessionTitleTemplate 渲染结果为空')
+  }
 }
 
 /** Windows 与 POSIX 通用的绝对路径判定。 */
@@ -280,7 +372,7 @@ function isAbsolutePath(value) {
  * 失败一律 401，且响应体不区分「token 错」与「token 缺失」。
  *
  * 实现在此完成（不依赖未核实 API），因为它是安全边界，不能留 TODO。
- * 比较必须是定长（timing-safe）：先用等长哈希再逐字符比较。
+ * 比较必须是定长（timing-safe）：先各自 sha256 到等长再比较。
  */
 function authorize(request, response, config) {
   const header = request?.headers?.authorization ?? request?.headers?.Authorization ?? ''
