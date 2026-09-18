@@ -42,16 +42,26 @@ export const ERROR_CODE = Object.freeze({
   QUEUE_FULL: 'queue_full',
   AGENT_BUSY: 'agent_busy',
   UNSUPPORTED: 'unsupported',
+  NOT_IMPLEMENTED: 'not_implemented',
   INTERNAL: 'internal',
 })
 
-/** 错误码 → HTTP 状态码。 */
+/**
+ * 错误码 → HTTP 状态码。
+ *
+ * `unsupported` 与 `not_implemented` 是两件事，别混：
+ *   - unsupported（400）：**请求**不合法（缺字段、类型错、Idempotency-Key 非 UUIDv4）。
+ *   - not_implemented（501）：请求合法，但**本端还没做**。
+ * 骨架阶段把两者混成 400 会让 IM 侧误以为是自己写错了参数，
+ * 于是反复重试同一个必然失败的请求（契约 §8）。
+ */
 export const ERROR_STATUS = Object.freeze({
   [ERROR_CODE.UNAUTHORIZED]: 401,
   [ERROR_CODE.NOT_FOUND]: 404,
   [ERROR_CODE.QUEUE_FULL]: 429,
   [ERROR_CODE.AGENT_BUSY]: 409,
   [ERROR_CODE.UNSUPPORTED]: 400,
+  [ERROR_CODE.NOT_IMPLEMENTED]: 501,
   [ERROR_CODE.INTERNAL]: 500,
 })
 

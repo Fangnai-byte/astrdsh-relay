@@ -62,18 +62,23 @@ def _() -> None:
 print("\nformat_location")
 
 
-@test("完整结果：标题 / 会话 id / 目录来源 / 工作区 全部呈现")
+@test("完整结果：标题 / 会话 id / 目录来源 全部呈现")
 def _() -> None:
     text = _joined({
         "found": True, "title": "星驿 · default/GroupMessage/1", "sessionId": "im-abc",
-        "cwd": "D:\\AI\\workspace", "source": "conversation", "workspaceId": "ws-1",
+        "cwd": "D:\\AI\\workspace", "source": "conversation",
     })
     assert "星驿 · default/GroupMessage/1" in text, text
     assert "im-abc" in text, text
     assert "D:\\AI\\workspace" in text, text
     assert "对话级配置" in text, text
-    assert "ws-1" in text, text
     assert "尚无绑定记录" not in text, text
+
+
+@test("workspaceId 是历史字段：即使被塞进来也不该出现在 IM 文本里")
+def _() -> None:
+    text = _joined({"found": True, "sessionId": "im-abc", "workspaceId": "ws-1"})
+    assert "ws-1" not in text, text
 
 
 @test("全局来源被标注为「全局默认」——用户要能区分是不是给本对话单独配的")

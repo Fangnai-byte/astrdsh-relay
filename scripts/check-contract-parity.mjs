@@ -97,7 +97,15 @@ function compareSets(label, jsValues, pyValues) {
   if (onlyPy.length) problems.push(`${label}：仅 Python 有 ${onlyPy.map(show).join('、')}`)
 }
 
-const show = (value) => (value === undefined ? 'undefined' : JSON.stringify(value))
+/**
+ * ⚠️ 必须是**函数声明**，不能写成 const 箭头函数：
+ * 上面第 40 行起就在顶层调用 expect()，而 expect() 在「一侧缺失」时会用到
+ * show()。写成 const 会踩 TDZ——即**唯独在契约真的不一致时**脚本崩溃，
+ * 拿 ReferenceError 顶替本该打印的差异清单，闸门等于在最该响的时候哑掉。
+ */
+function show(value) {
+  return value === undefined ? 'undefined' : JSON.stringify(value)
+}
 
 /**
  * 极简 Python 常量解析器。

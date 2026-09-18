@@ -86,21 +86,36 @@ test('未知占位符原样保留（配置写错要看得见，而不是静默�
 console.log('\nnormalizeRecord / parseState')
 
 test('normalizeRecord 把错误类型归为 null 而不是崩溃', () => {
-  const record = normalizeRecord('c', { sessionId: 42, cwd: '', workspaceId: '  ', seq: 'x', createdAt: NaN })
+  const record = normalizeRecord('c', { dshSessionId: null, cwd: '', policy: '  ', seq: 'x', createdAt: NaN })
   assert.deepStrictEqual(record, {
-    conversation: 'c', sessionId: null, cwd: null, workspaceId: null,
+    conversation: 'c', dshSessionId: null, cwd: null,
     policy: null, createdAt: null, lastActiveAt: null, seq: 0,
   })
+})
+
+test('dshSessionId 类型不对 → 抛错，绝不降级为 null（§12.5）', () => {
+  throws(() => normalizeRecord('c', { dshSessionId: 42 }), /dshSessionId/, '非字符串应抛错')
+  throws(() => normalizeRecord('c', { dshSessionId: '   ' }), /dshSessionId/, '空白串应抛错')
+})
+
+test('旧字段名 sessionId 作为一次性别名读入', () => {
+  assert.equal(normalizeRecord('c', { sessionId: 'legacy-1' }).dshSessionId, 'legacy-1')
+})
+
+test('未知字段（含 workspaceId）被丢弃，不进记录', () => {
+  const record = normalizeRecord('c', { dshSessionId: 'im-1', workspaceId: 'w', whatever: 1 })
+  assert.ok(!('workspaceId' in record), 'workspaceId 无人读取，不应留在记录里')
+  assert.ok(!('whatever' in record))
 })
 
 test('合法 state 解析成功', () => {
   const parsed = parseState({
     version: STATE_VERSION,
-    conversations: { 'a:b:c': { sessionId: 'im-1', cwd: 'D:\\ws', seq: 3 } },
+    conversations: { 'a:b:c': { dshSessionId: 'im-1', cwd: 'D:\\ws', seq: 3 } },
   })
   assert.equal(parsed.ok, true)
   assert.equal(parsed.records.length, 1)
-  assert.equal(parsed.records[0].sessionId, 'im-1')
+  assert.equal(parsed.records[0].dshSessionId, 'im-1')
   assert.equal(parsed.records[0].seq, 3)
 })
 
@@ -207,7 +222,7 @@ test('保存后能读回（含原子写不留临时文件）', () => {
   assert.ok(!existsSync(`${path}.tmp-${process.pid}`), '不应残留临时文件')
   const { records, existed } = loadState(path)
   assert.equal(existed, true)
-  assert.equal(records.get('p:M:s').sessionId, 'im-1')
+  assert.equal(records.get('p:M:s').dshSessionId, 'im-1')
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).version, STATE_VERSION)
 })
 
