@@ -13,3 +13,10 @@ Thumbs.db
 .idea/
 # ── 脱敏前的原始副本（本地留存，不入库）──
 _raw-before-sanitize-*.zip
+
+# ── 发布产物与本地 npm 缓存（不入库）──
+dist/
+*.tgz
+.npm-cache/
+# ── 本地一次性工具与令牌（不入库）──
+.local/

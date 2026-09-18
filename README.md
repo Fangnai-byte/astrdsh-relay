@@ -27,9 +27,37 @@
 | `docs/evidence/` | 实跑固化证据（`dsh --profile web --dump-config` 的实际层组合输出）。 |
 | `dsh-astrbot-relay/` | DSH 侧 host 插件骨架（`package.json` / `cordis.patch.yml` / `lib/contract.js` / `lib/index.js`）。 |
 | `astrbot_plugin_dsh_relay/` | AstrBot 侧 Star 插件骨架（`main.py` / `_conf_schema.json` / `metadata.yaml` / `contract.py`）。 |
+| `docs/RELEASING.md` | 发版流程：统一版本规则、tag 约定、产物形态与原因、CI 检查项。 |
+| `scripts/package-release.mjs` | 打包脚本：校验 tag 与两侧版本 → 产出 tgz + zip + SHA256SUMS + 发布说明。 |
+| `scripts/check-contract-parity.mjs` | 两侧契约常量一致性闸门（事件类型 / 错误码 / 路由 / 版本）。 |
+| `.github/workflows/` | CI（语法 + 契约一致性 + 版本闸门 + 打包冒烟）与 Release（tag 触发自动发版）。 |
 | `AstrBot插件开发指南总结.md` | 社区整理的 AstrBot 插件开发指南（参考资料，**非**本项目产出，部分条目与源码不符，见 DESIGN §1）。 |
 | `新建 文本文档.txt` | DSH 官方插件开发教程文本（参考资料，非本项目产出）。 |
 
+## 发布（Releases）
+
+两个插件采用**统一版本**：版本号在两处必须相等，一个 tag 同时发两个产物。
+
+| 产物 | 装法 |
+|---|---|
+| `dsh-astrbot-relay-<v>.tgz` | `dsh plugin --profile web add ./dsh-astrbot-relay-<v>.tgz` |
+| `astrbot_plugin_dsh_relay-<v>.zip` | 解压到 `AstrBot/data/plugins/` |
+
+DSH 侧发**预打包 tgz** 而不是让人从 git 装，是因为 git 安装要靠包的 `prepare` 现场构建，
+而 pnpm ≥10 默认拒绝运行 git 依赖的构建脚本、需要用户显式授权（等于允许该包在你机器上
+执行安装期代码）。本包是纯 ESM JS、无构建步骤，所以走 tgz 可以让安装路径**完全不需要**
+这项授权。
+
+```powershell
+node scripts/package-release.mjs --check   # 只校验版本与必需文件
+node scripts/package-release.mjs           # 本地冒烟打包到 dist/
+git tag v0.1.0 && git push origin v0.1.0   # 触发 Release workflow 自动发版
+```
+
+流程细节、产物形态的理由、CI 检查项见 `docs/RELEASING.md`。
+
+> ⚠️ 当前 `v0.1.x` 是 **P0 骨架**：装得上，但跑不起来（未实现端点返回「未实现」）。
+> 自动生成的发布说明会在开头显式声明这一点，P1 打通前不要移除。
 ## 三个决定性结论（都改变了原始设计）
 
 1. **路线选 A**：AstrBot 侧普通 Star 插件，复用现有 IM 适配器。

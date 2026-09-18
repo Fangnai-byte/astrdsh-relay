@@ -1,0 +1,56 @@
+name: Release
+
+# 统一版本：一个 tag 同时发两个产物。
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（形如 v0.1.0，必须与两侧插件版本号一致）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 解析 tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 这一步会因版本不一致 / tag 与版本不匹配而失败——这是有意的闸门。
+      - name: 校验版本并打包
+        run: node scripts/package-release.mjs "${{ steps.tag.outputs.value }}"
+
+      - name: 核对校验和
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: AstrDsh Relay ${{ steps.tag.outputs.value }}
+          body_path: dist/RELEASE_NOTES.md
+          # 版本号带 -rc/-beta 之类的后缀时自动标记为预发布
+          prerelease: ${{ contains(steps.tag.outputs.value, '-') }}
+          files: |
+            dist/*.tgz
+            dist/*.zip
+            dist/SHA256SUMS

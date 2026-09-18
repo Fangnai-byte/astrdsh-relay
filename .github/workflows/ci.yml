@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # DSH 侧骨架是纯 ESM JS，只需语法可解析即可被 cordis 加载
+      - name: DSH 侧 JS 语法
+        run: |
+          node --check dsh-astrbot-relay/lib/index.js
+          node --check dsh-astrbot-relay/lib/contract.js
+
+      # AstrBot 侧骨架不 import astrbot，因此 py_compile 不需要装依赖
+      - name: AstrBot 侧 Python 语法
+        run: python -m py_compile astrbot_plugin_dsh_relay/main.py astrbot_plugin_dsh_relay/contract.py
+
+      - name: 两侧契约常量一致性（事件名/错误码/路由）
+        run: node scripts/check-contract-parity.mjs
+
+      # 统一版本闸门：两侧版本号必须相等
+      - name: 版本一致性
+        run: node scripts/package-release.mjs --check
+
+      # 完整打包冒烟：产物路径与 zip/tgz 归档器都要能跑通
+      - name: 打包冒烟
+        run: |
+          node scripts/package-release.mjs
+          cd dist && sha256sum -c SHA256SUMS
+
+      - name: 上传产物（失败时便于排查）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-debug
+          path: dist/
+          if-no-files-found: ignore
