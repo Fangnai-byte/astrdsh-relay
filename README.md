@@ -99,3 +99,7 @@ base_url」被**实机推翻**：connector 的 33 个点号 endpoint **33/33 全
 是机械的）。代价是**把整个 `/api` 面暴露给 IM**，因此强制方法白名单 + ADMIN
 权限门成了必做项，不是加固项。结论见 `docs/control-plane-transport.md`，
 落地要求见 `docs/DESIGN.md` §7.3 / §7.3.1。
+
+## 许可证
+
+MIT，见 [LICENSE](./LICENSE)。
