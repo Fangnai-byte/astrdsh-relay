@@ -340,7 +340,14 @@ DSH 内 agent 触发敏感工具
 | `queue_full` | 429 | 队列满 | 回「排队中」，不重试 |
 | `agent_busy` | 409 | 同 conversation 已有在途 turn 且策略不允许排队 | 提示「正在处理上一条」 |
 | `unsupported` | 400 | 未知 `type` / 不支持的字段组合 | 记日志，回执给用户 |
+| `not_implemented` | 501 | 请求**合法**，但网桥这一端还没实现（骨架端点） | 不回重试，直接告诉用户「该功能尚未实现」，并在桥接问题清单里留痕 |
 | `internal` | 500 | DSH 内部错误 | 可重试一次，然后向用户报错 |
+
+> `unsupported` 与 `not_implemented` **不是同一件事，禁止混用**：
+> 前者是「你发的东西我不认」（调用方的问题），后者是「你发的东西没问题，
+> 只是我还没做」（实现方的问题）。骨架阶段把未实现端点回成 400，
+> 会让 IM 侧误以为是自己参数写错，于是反复重试一个必然失败的请求。
+> 未实现的端点必须**如实失败**，不许返回假成功。
 
 **错误必须响亮**（沿用 DSH 的设计原则）：配置非法时 DSH 侧插件**加载即失败**
 （Schemastery `required()`），而不是运行期静默降级。
@@ -454,7 +461,6 @@ DSH 侧在进程内通过 `ctx.connection.createSharedFetchHandler('/api')` 把�
   "sessionId": "im-3f9a1c7e-...",                      // 无则 null
   "title": "星驿 · default/GroupMessage/1000000001",    // 反向定位用：DSH 会话标题
   "cwd": "D:\\AI\\workspace",
-  "workspaceId": null,
   "source": "conversation",                            // conversation | global | none
   "policy": "one-to-one",
   "createdAt": 1700000000000,
@@ -488,13 +494,17 @@ DSH 侧在进程内通过 `ctx.connection.createSharedFetchHandler('/api')` 把�
 
 | 命中 | `source` |
 |---|---|
-| 记录里有 `cwd` 或 `workspaceId` | `conversation` |
+| 记录里有 `cwd` | `conversation` |
 | 否则用插件全局 `cwd` | `global` |
 | 两处都没有 | `none`（由调用方决定是否报错；本版只如实呈现） |
 
-对话级覆盖存放在 `state.json` 的记录里（`cwd` / `workspaceId`）。
+对话级覆盖存放在 `state.json` 的记录里（`cwd`）。
 **写入路径留给 P5 控制面**——在权限模型（§7.3.1）就位之前不开写面。
 因此 §12 在当前版本是**只读**的：要按对话区分目录，可以直接人工编辑 `state.json`。
+
+> `source` 必须与**最终生效的 `cwd`** 同源：先定 `cwd`，再据此定 `source`。
+> 否则会出现「说来源是对话级、给出的却是全局目录」这种自相矛盾的诊断。
+> （历史字段 `workspaceId` 已删除，见 §12.5.1。）
 
 ### 12.4 反向定位：DSH 会话标题
 
@@ -518,12 +528,32 @@ DSH 侧在进程内通过 `ctx.connection.createSharedFetchHandler('/api')` 把�
   "version": 1,
   "conversations": {
     "default:GroupMessage:1000000001": {
-      "sessionId": "im-...", "cwd": null, "workspaceId": null,
+      "dshSessionId": "im-...", "cwd": null,
       "policy": "one-to-one", "createdAt": 0, "lastActiveAt": 0, "seq": 0
     }
   }
 }
 ```
+
+#### 12.5.1 两套命名空间（**读之前先看这一条**）
+
+同一件东西——「这个 IM 会话绑定的那个 DSH 会话」——在**两个地方用了两个名字**，
+这是有意的，不是改了一半的过渡态：
+
+| 位置 | 字段名 | 理由 |
+|---|---|---|
+| `state.json` 持久化记录 | `dshSessionId` | 它**就是** DSH 侧的会话 id，名字必须自证其身份，避免被误当成 IM 侧的 `sessionId` |
+| `GET /where` 响应 | `sessionId` | 面向 IM 的 UX 字段，AstrBot 侧 `location_text.py` 已在读它，**改动会让两侧发布节奏互相绑架** |
+| `POST /events` 等协议体 | `sessionId` | 线上协议字段，见 §2.2 |
+
+- 桥接端在 `resolveLocation()` 做**显式转译**：读 `record.dshSessionId`，答 `sessionId`。
+  这个转译点是全仓唯一允许出现「两个名字同框」的地方。
+- 读入侧兼容旧名：`dshSessionIdOf()` 接受 `dshSessionId ?? sessionId`，
+  因此**旧 state.json 可以原样加载**；但写出**一律只用 `dshSessionId`**，
+  旧名不会被写回，属于单向兼容。
+- 已被删除的字段：`workspaceId`。它从未被任何写路径赋值，永远是 `null`，
+  属于「协议里长得像有、实际恒空」的坑，读它的人会以为存在工作区概念。
+  AstrBot 侧对应的恒空分支已一并删除。
 
 - 默认路径 `<DSH_HOME>/astrbot-relay/state.json`；`statePath` 可覆盖，**必须是绝对路径**。
 - **原子写**：写同目录临时文件再 `rename`（直接覆写在崩溃时会留下半截 JSON，

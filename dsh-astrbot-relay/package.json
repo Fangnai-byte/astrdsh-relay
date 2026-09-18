@@ -20,17 +20,13 @@
       "patch": "./cordis.patch.yml"
     }
   },
+  "dependencies": {
+    "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-brand": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
+    "@deepseek-ai/schemastery": "3.18.2"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
-  },
-  "_comment_dependencies": [
-    "P1 决策点【未核实】：本插件需要 createUserMessage 构造 UserMessage。",
-    "它位于 @deepseek-ai/dsh-llm，会 deep-freeze 消息；手写对象字面量会绕过 freeze，",
-    "可能违反 dsh 的不可变不变量，因此倾向 import。",
-    "但已核实的两个真实第三方插件（dsh-skin-market）都不 import @deepseek-ai/dsh-* 运行时包。",
-    "P1 必须先实测下面两条路线哪条可行：",
-    "  (a) 在 dependencies 里声明 @deepseek-ai/dsh-llm（版本需与安装的 dsh 对齐），",
-    "  (b) 从 ctx 上取一个提供消息工厂的服务（若存在）。",
-    "在实测结论出来之前不要把它写进 dependencies，也不要手写替代品。"
-  ]
+  }
 }

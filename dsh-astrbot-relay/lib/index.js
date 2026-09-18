@@ -1,12 +1,16 @@
 /**
  * dsh-astrbot-relay（星驿）— IM ↔ DSH 网桥（DSH 侧 / host half）
  *
- * 这是**骨架 + 已实现的只读部分**：
+ * 这是**骨架 + 已实现部分**：
  *   - 已实现：插件契约（name / inject / Config / apply）、配置与 state 校验、
  *     路由表、Bearer 定长鉴权、健康检查、**定位（契约 §12）**、
- *     会话标题渲染、state.json 的原子读写。
- *   - 未实现：会话驱动、事件转发、审批 waterfall、幂等/背压/环形缓冲。
- *     未实现处一律返回 501 并带明确的 TODO，**不会**假装成功。
+ *     会话标题渲染、state.json 的原子读写、
+ *     **投递 POST /message（§3.1：幂等表 + 背压 + create/resume 分流 + followup）**、
+ *     **幂等记账（§6.1：有界 LRU + TTL + 在途标记）**、
+ *     **环形缓冲与 SSE 广播骨架（§3.2 的 push/deliver/trimBuffer）**。
+ *   - 未实现：SSE 端点接线、事件转发、审批 waterfall、轮转策略。
+ *     未实现处一律返回 **501 not_implemented**（不是 400 unsupported：请求合法，是本端没做），
+ *     并带明确的 TODO，**不会**假装成功。
  *
  * 契约真相来源：`docs/BRIDGE-CONTRACT.md`
  * 设计依据：    `docs/DESIGN.md` §3
@@ -21,14 +25,17 @@
  *      的事件 → 必须自己按 agent.id 过滤，否则串台到用户在 Web UI 的会话。
  */
 import {
-  createHash, randomUUID, timingSafeEqual as nodeTimingSafeEqual,
+  createHash, timingSafeEqual as nodeTimingSafeEqual,
 } from 'node:crypto'
 import Schema from '@deepseek-ai/schemastery'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   BRIDGE_VERSION, ROUTES, ERROR_CODE, ERROR_STATUS, POLICY,
-  APPROVAL_OUTCOME_ALLOWED, newSessionId,
+  APPROVAL_OUTCOME_ALLOWED, EVENT, newSessionId,
 } from './contract.js'
-import { resolveLocation, renderSessionTitle } from './location.js'
+import { newRecord, resolveLocation, renderSessionTitle } from './location.js'
 import { loadState, resolveStatePath, saveState } from './state.js'
 
 export const name = 'dsh-astrbot-relay'
@@ -37,7 +44,7 @@ export const name = 'dsh-astrbot-relay'
  * 依赖服务。框架会等它们就绪后再跑 apply。
  * 已核实：`dsh-agent-loop` 提供 agents factory，且本机 web profile 已挂载它。
  */
-export const inject = ['webServer', 'agents', 'sessions']
+export const inject = ['webServer', 'agents', 'sessions', 'agentDefaultModel']
 
 /**
  * 配置 schema。
@@ -99,9 +106,184 @@ export function apply(ctx, config) {
   const statePath = resolveStatePath(config.statePath)
   const { records, existed: stateExisted } = loadState(statePath)
 
-  ctx.inject(['webServer', 'agents', 'sessions'], (host) => {
+  ctx.inject(['webServer', 'agents', 'sessions', 'agentDefaultModel'], (host) => {
     const log = host.logger ?? ctx.logger
     const tag = `[${name}]`
+
+    // ────────────────────────────────────────────────────────────────
+    // 运行时状态（纯内存）
+    // ────────────────────────────────────────────────────────────────
+
+    /** UUIDv4 形状校验（幂等键必填，契约 §3.1）。 */
+    const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+    /**
+     * conversation → 网桥实例。
+     * `queue` 只统计**在途**投递（已接受、尚未 whenIdle），用于背压（契约 §6.3）。
+     */
+    const bridges = new Map()
+
+    /**
+     * Idempotency-Key → { body, at }。
+     * 有界 LRU（`idempotencyEntries`，默认 512）+ TTL（`idempotencyTtlMs`，默认 10 分钟），
+     * **只覆盖 /message**（契约 §6.1）。不持久化：进程重启即作废，这是契约允许的。
+     */
+    const idempotency = new Map()
+
+    /** 取（必要时新建）某对话的网桥实例；dshSessionId 优先取 state.json 里的既有映射。 */
+    function bridgeOf(conversation) {
+      let bridge = bridges.get(conversation)
+      if (!bridge) {
+        bridge = {
+          conversation,
+          // 内存态直接用 state 的字段名（dshSessionId），避免「同一件事两个叫法」
+          // 在序列化处被手滑写错；面向 IM 的 sessionId 只在 handleWhere 出口转译。
+          dshSessionId: records.get(conversation)?.dshSessionId ?? '',
+          agent: null,
+          // create/resume 返回的 AgentHandle 是**能力对象**（{ agent, dispose }）：
+          // 只有持有者能拆，所以 dispose 必须留着，卸载收尾时才拆得掉（本文件 TODO(P1)）。
+          dispose: null,
+          // 「正在附着」标志：同一 DSH 会话不允许并发 resume，网桥侧自己判定，
+          // 不指望宿主抛出稳定的忙异常（grep 全 dsh 包无 AgentBusy 类）。
+          attaching: false,
+          queue: 0,
+          subscribers: new Set(),
+          buffer: [],
+          seq: 0,
+          approvals: new Map(),
+        }
+        bridges.set(conversation, bridge)
+      }
+      return bridge
+    }
+
+    /** 记录请求头（node 会小写化，但不要假设，两边都查一次）。 */
+    function headerOf(request, name) {
+      const headers = request?.headers ?? {}
+      const value = headers[name] ?? headers[name.toLowerCase()]
+      return typeof value === 'string' ? value.trim() : ''
+    }
+
+    /**
+     * 读并解析 JSON 请求体。
+     * 超 1 MiB 直接掐断（IM 文本消息不该这么大），解析失败返回 null。
+     */
+    function readJsonBody(request) {
+      return new Promise((resolve) => {
+        let settled = false
+        const done = (value) => { if (!settled) { settled = true; resolve(value) } }
+        const chunks = []
+        let size = 0
+        request.on('data', (chunk) => {
+          size += chunk.length
+          if (size > 1_048_576) {
+            request.destroy()
+            done(null)
+            return
+          }
+          chunks.push(chunk)
+        })
+        request.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8')
+          if (raw.trim() === '') { done({}); return }
+          try { done(JSON.parse(raw)) } catch { done(null) }
+        })
+        request.on('error', () => done(null))
+      })
+    }
+
+    /** 只广播不入缓冲：给「结果说明帧」用（gap 就是这一类）。 */
+    function broadcast(bridge, envelope) {
+      for (const subscriber of [...bridge.subscribers]) {
+        try {
+          subscriber(envelope)
+        } catch (error) {
+          // 单个订阅者发送失败不得拖垮其他连接。
+          log?.warn?.(`${tag} SSE 写出失败：${String(error)}`)
+        }
+      }
+    }
+
+    /** 广播一帧：先入环形缓冲（供 Last-Event-ID 重放），再推给所有订阅者。 */
+    function deliver(bridge, envelope) {
+      bridge.buffer.push(envelope)
+      broadcast(bridge, envelope)
+    }
+
+    /**
+     * 生成并下发一帧下行事件（带自增 seq 与 ts，契约 §4）。
+     * 缓冲溢出时丢最旧的，并追发一帧 `gap` 告知客户端存在空洞（契约 §3.2）。
+     */
+    function push(conversation, frame) {
+      const bridge = bridgeOf(conversation)
+      const envelope = { seq: (bridge.seq += 1), ts: Date.now(), ...frame }
+      deliver(bridge, envelope)
+
+      const cap = Math.max(2, Math.trunc(config.eventBufferSize))
+      // 留一格给紧随其后的 gap 帧，缓冲才真正稳定在 cap 条以内（原版会留 cap+1 条）。
+      if (bridge.buffer.length > cap - 1) {
+        const firstDropped = bridge.buffer[0].seq
+        bridge.buffer.splice(0, bridge.buffer.length - (cap - 1))
+        // gap 只广播、**不入缓冲**：它是「缓冲刚被截断」的结果说明，
+        // 进了缓冲就会被当成可重放的历史帧，重放时反而对不上真实的空洞。
+        broadcast(bridge, {
+          seq: (bridge.seq += 1), ts: Date.now(), type: EVENT.GAP, fromSeq: firstDropped,
+        })
+      }
+      return envelope
+    }
+
+    /** 幂等查表：过期条目顺手清掉，命中后挪到 Map 末尾（LRU 语义）。 */
+    function idempotencyLookup(key) {
+      const entry = idempotency.get(key)
+      if (!entry) return null
+      if (Date.now() - entry.at > config.idempotencyTtlMs) {
+        idempotency.delete(key)
+        return null
+      }
+      idempotency.delete(key)
+      idempotency.set(key, entry)
+      return entry
+    }
+
+    /** 裁掉最旧的条目以维持上界（在途标记与最终结果一视同仁）。 */
+    function idempotencyTrim() {
+      const limit = Math.max(1, Math.trunc(config.idempotencyEntries))
+      while (idempotency.size > limit) {
+        idempotency.delete(idempotency.keys().next().value)
+      }
+    }
+
+    /**
+     * 记一个**在途标记**：必须在投递前、且在**第一个 await 之前**写下。
+     * 条目形如 `{ at, pending: true, conversation, body: null }`。
+     */
+    function idempotencyMarkPending(key, conversation) {
+      idempotency.delete(key)
+      idempotency.set(key, { at: Date.now(), pending: true, conversation, body: null })
+      idempotencyTrim()
+    }
+
+    /**
+     * 撤掉在途标记：只有「因我方原因本次没被接受」时才用（入参错、背压、并发冲突）。
+     * 否则同一把键第二次重试会命中标记、拿到 duplicate: true，消息却永远投不出去。
+     */
+    function idempotencyForget(key) {
+      idempotency.delete(key)
+    }
+
+    /** 幂等记账：把首次响应的 202 体写下（原地覆盖在途标记），并裁到上界。 */
+    function idempotencyRemember(key, body) {
+      const previous = idempotency.get(key)
+      idempotency.delete(key)
+      idempotency.set(key, {
+        at: Date.now(),
+        pending: false,
+        conversation: previous?.conversation || body.conversation,
+        body,
+      })
+      idempotencyTrim()
+    }
 
     // ────────────────────────────────────────────────────────────────
     // 路由表
@@ -213,11 +395,190 @@ export function apply(ctx, config) {
       })
     }
 
-    /** POST /message — TODO(P1)。 */
-    function handleMessage(request, response) {
+    /**
+     * POST /message — 投递一条 IM 用户消息（契约 §3.1）。**已实现**。
+     *
+     * 顺序不可换：鉴权 → Idempotency-Key（必填 UUIDv4）→ 幂等查表 → 背压判定
+     * → loader.await()（等 boot 完成）→ agents.create（setup 装 model selection）
+     * → followup → 202。
+     *
+     * ⚠️ `text/delta` 是瞬时事件，IM 侧必须先连 SSE 再 POST，否则丢流（文件头第 2 条）。
+     */
+    async function handleMessage(request, response) {
       if (!authorize(request, response, config)) return
-      writeError(response, ERROR_CODE.UNSUPPORTED,
-        'POST /message 尚未实现（P1）。骨架不假装成功。')
+
+      const key = headerOf(request, 'idempotency-key')
+      if (!key || !UUID_V4.test(key)) {
+        writeError(response, ERROR_CODE.UNSUPPORTED,
+          'Idempotency-Key 必填且必须是 UUIDv4（契约 §3.1）')
+        return
+      }
+
+      // 幂等命中：原样重放首次的 202，只把 duplicate 置 true，绝不二次投递。
+      const seen = idempotencyLookup(key)
+      if (seen) {
+        // 在途标记：同一把键的第一封还没落地。此时**不能**当 duplicate 放行
+        // （duplicate 的语义是「已经投出去过」，这里恰好相反），回 409 让客户端稍后重试。
+        if (seen.pending) {
+          writeError(response, ERROR_CODE.AGENT_BUSY,
+            '同一 Idempotency-Key 的上一封消息仍在投递中',
+            { conversation: seen.conversation || null })
+          return
+        }
+        writeJson(response, 202, { ...seen.body, duplicate: true })
+        return
+      }
+
+      // ⚠️ 顺序有讲究：在途标记必须写在**第一个 await 之前**。
+      // 写在 readJsonBody / agents.create 之后的话，同一把键并发两封会在
+      // 两个 await 之间双双查不到标记，各自投一遍——这就是 TOCTOU。
+      idempotencyMarkPending(key, '')
+
+      const body = await readJsonBody(request)
+      if (!body || typeof body !== 'object') {
+        idempotencyForget(key)
+        writeError(response, ERROR_CODE.UNSUPPORTED, '请求体必须是合法 JSON 对象')
+        return
+      }
+      const conversation = typeof body.conversation === 'string' ? body.conversation.trim() : ''
+      const text = typeof body.text === 'string' ? body.text : ''
+      if (!conversation) {
+        idempotencyForget(key)
+        writeError(response, ERROR_CODE.UNSUPPORTED, '缺少 conversation（IM 会话键，形如 default:GroupMessage:1000000001）')
+        return
+      }
+      if (text.trim() === '') {
+        idempotencyForget(key)
+        writeError(response, ERROR_CODE.UNSUPPORTED, 'text 不能为空')
+        return
+      }
+      // 解析出会话键后回填标记，好让并发的那一封的 409 里带上 conversation。
+      const pendingEntry = idempotency.get(key)
+      if (pendingEntry) pendingEntry.conversation = conversation
+
+      const bridge = bridgeOf(conversation)
+      const maxQueued = Math.max(1, Math.trunc(config.maxQueuedPerConversation))
+      if (bridge.queue >= maxQueued) {
+        // 背压：429 + retry-after，IM 侧**不得**立即自动重试（契约 §6.3）。
+        idempotencyForget(key)
+        writeError(response, ERROR_CODE.QUEUE_FULL,
+          `会话在途消息已达上限 ${maxQueued}`, { conversation, queueDepth: bridge.queue })
+        return
+      }
+      // 同一会话的 attach 串行化：已有一次 resume/create 在途时直接 409。
+      // dsh 包内没有 AgentBusy 类可以依赖（grep 过全包），所以由网桥自己判定；
+      // 否则两次 resume 同一 sessionId 会各拿一个 handle，dispose 谁都拆不对。
+      if (bridge.attaching) {
+        idempotencyForget(key)
+        writeError(response, ERROR_CODE.AGENT_BUSY,
+          '该会话已有一次 create/resume 在途', { conversation })
+        return
+      }
+      bridge.attaching = true
+      bridge.queue += 1
+
+      try {
+        // 1) boot 闸门：loader 未就绪时 agents.create 会失败。loader 缺席也不阻塞投递。
+        try {
+          await (typeof host.get === 'function' ? host : ctx).get('loader')?.await?.()
+        } catch { /* 非 launcher 环境下没有 loader，忽略 */ }
+
+        // 2) 冷启动：没有映射就先分配一个 id 并落盘（轮转策略在建映射时决定）。
+        //    注意这里只分配 **id**，会话本体由下面的 create 建；已有映射时连 id 都不动。
+        const hadMapping = Boolean(bridge.dshSessionId)
+        if (!bridge.dshSessionId) {
+          bridge.dshSessionId = newSessionId()
+          // 只写契约 §2.2 / §12.5 规定的字段。
+          // 不落 platform / messageType / title：前两者可从会话键
+          // （parseConversation）推出来，落盘等于复制一份会漂移的真相；
+          // 标题由 sessionTitleTemplate 渲染，是**渲染结果**而非状态。
+          // 落盘字段多一个，normalizeRecord/serializeState 的白名单就多一处要同步，
+          // 一旦漏同步就会出现「写进去了、重启后没了」的静默丢数据。
+          // 记录形状的唯一权威是 location.js 的 normalizeRecord/newRecord，
+          // 这里不再手写字段列表：手写就等于把白名单抄了第二份，漂移的后果是
+          // 「写进去的字段重启后读不回来」——静默丢映射，最难查。
+          // 不落的字段：platform / messageType（可从会话键推出，落盘是复制一份会漂移的
+          // 真相）、title（是 sessionTitleTemplate 的**渲染结果**而非状态）。
+          records.set(conversation, newRecord({
+            conversation,
+            dshSessionId: bridge.dshSessionId,
+            // cwd 留 null = 对话级无覆盖，跟随全局配置（§12.3）。
+            // workspaceId 已删除（P5 控制面才有实现，留着只会让人以为配了会生效）。
+            policy: config.policy,
+          }))
+          persistRecords()
+        }
+
+        // 工作目录必须走 locationFor（对话级覆盖 → 全局配置，§12.3）：
+        // 直接取 config.cwd 会让人工写进 state.json 的对话级 cwd 形同虚设。
+        const location = locationFor(conversation)
+        const cwd = location.cwd ?? config.cwd
+
+        // 每次投递取一份 selection 快照并随 agent 固定下来：
+        // installModelSelection 会把选中结果回写到 .assembled。照抄 dsh-headless:126-145。
+        const selection = host.agentDefaultModel.currentSelection()
+        const attachOptions = {
+          agentOptions: { provider: selection.provider, model: selection.model },
+          setup: (agentCtx) => {
+            installModelSelection(agentCtx, { current: selection, assembled: void 0 })
+          },
+        }
+
+        // 3) create / resume 分流（照抄 dsh-api-session-controller/lib/index.js:398-402、442-446）。
+        //    已有映射必须走 resume：对同一个 sessionId 重复 create 会被宿主当成
+        //    「会话已存在」而失败——「有映射就复用」这句注释在只有 create 的版本里
+        //    根本没落地。
+        const handle = hadMapping
+          ? await host.agents.resume({
+            resumeSessionId: brandString(bridge.dshSessionId),
+            ...attachOptions,
+          })
+          : await host.agents.create({
+            sessionId: brandString(bridge.dshSessionId),
+            meta: { cwd },
+            ...attachOptions,
+          })
+        // AgentHandle 是能力对象（{ agent, dispose }，dsh-agent/lib/types/index.d.ts:150-153）：
+        // dispose 只有持有者才调得动，存下来卸载收尾时才有得拆。
+        bridge.agent = handle.agent
+        bridge.dispose = handle.dispose
+
+        agent.followup(createUserMessage({
+          content: [{ type: 'text', text }],
+          source: { kind: 'user' },
+        }))
+
+        // 3) 不阻塞响应：空闲后 flush 会话记录再放掉在途计数（契约 §9 顺序）。
+        agent.whenIdle()
+          .then(() => host.sessions.flush(agent.session))
+          .catch((error) => log?.warn?.(`${tag} 会话收尾失败：${String(error)}`))
+          .finally(() => {
+            bridge.queue = Math.max(0, bridge.queue - 1)
+            bridge.attaching = false
+          })
+
+        // 记账：lastActiveAt 是轮转策略（on-demand / daily）判活的依据（§2.3），
+        // 投递成功必须更新它，否则「久未活动」永远判不出来。
+        const record = records.get(conversation)
+        if (record) {
+          record.lastActiveAt = Date.now()
+          persistRecords()
+        }
+
+        const accepted = {
+          accepted: true, conversation, queueDepth: bridge.queue, duplicate: false,
+        }
+        idempotencyRemember(key, accepted)
+        writeJson(response, 202, accepted)
+      } catch (error) {
+        bridge.queue = Math.max(0, bridge.queue - 1)
+        bridge.attaching = false
+        // 因我方原因没接受：撤掉在途标记，否则同一把键重试会命中标记拿到
+        // duplicate: true，而消息其实一次都没投出去。
+        idempotencyForget(key)
+        writeError(response, ERROR_CODE.INTERNAL,
+          `投递失败：${String(error?.message ?? error)}`)
+      }
     }
 
     /** GET /events — TODO(P2)。 */
@@ -232,7 +593,9 @@ export function apply(ctx, config) {
       //   response.write(': connected\n\n')
       //   ... 按 Last-Event-ID 从环形缓冲重放 ...
       //   response.on('close', cleanup)
-      writeError(response, ERROR_CODE.UNSUPPORTED,
+      // 501 not_implemented：本端**没做**这件事，与 400 unsupported
+      // （请求本身不合法）是两回事——IM 侧据此决定「等升级」还是「改请求」。
+      writeError(response, ERROR_CODE.NOT_IMPLEMENTED,
         'GET /events 尚未实现（P2）。骨架不假装成功。')
     }
 
@@ -243,7 +606,7 @@ export function apply(ctx, config) {
       //   + outcome ∈ APPROVAL_OUTCOME_ALLOWED
       //   已决议/已超时 → 409（幂等冲突，不算错误）
       void APPROVAL_OUTCOME_ALLOWED
-      writeError(response, ERROR_CODE.UNSUPPORTED,
+      writeError(response, ERROR_CODE.NOT_IMPLEMENTED,
         'POST /approval 尚未实现（P2）。骨架不假装成功。')
     }
 
@@ -281,34 +644,38 @@ export function apply(ctx, config) {
     // 定位与 state
     // ────────────────────────────────────────────────────────────────
 
-    /** 组装某个会话的定位结果。工作目录顺序：对话级覆盖 → 全局配置。 */
+    /**
+     * 组装某个会话的定位结果。工作目录顺序：对话级覆盖 → 全局配置（§12.3）。
+     *
+     * 注意输出的 `sessionId` 是**面向 IM 的字段名**，内部存的叫 dshSessionId
+     * （见 lib/location.js 顶部说明）；转译只发生在这里与 resolveLocation 一处。
+     */
     function locationFor(conversation) {
       return resolveLocation({
         conversation,
         record: records.get(conversation) ?? null,
         globalCwd: config.cwd,
-        // P5 控制面才会引入全局 workspaceId 配置；现在恒为空。
-        globalWorkspaceId: '',
         titleTemplate: config.sessionTitleTemplate,
         statePath,
       })
     }
 
     /**
-     * 落盘映射表（原子写）。P1 建立/回收会话时调用——
-     * 现在没有调用方，所以定位是**只读**的：state.json 可以人工编辑，
-     * 写入路径留给 P1，避免在权限模型（§7.3.1）就位前先开出写面。
+     * 落盘映射表（原子写）。调用点：建映射、更新 lastActiveAt（§2.2）。
+     * 只读面以外的写路径仍留给 P5 控制面——state.json 可以人工编辑。
      */
     function persistRecords() {
-      saveState(statePath, records)
+      // 落盘失败**不得**逃逸：它一旦抛出去就会落到 handleMessage 的兜底 catch 里，
+      // 被记成「投递失败」并递减 queue，掩盖真实故障（磁盘满、state.json 只读……）。
+      // 映射表在内存里已经是对的，写不进去只该留一条 warn，不该影响已接受的投递。
+      try {
+        saveState(statePath, records)
+      } catch (error) {
+        log?.warn?.(`${tag} state.json 落盘失败（内存态仍有效）：${String(error?.message ?? error)}`)
+      }
     }
 
-    log?.info?.(`${tag} loaded（定位已可用：GET ${config.pathPrefix}${ROUTES.WHERE}）`)
-
-    // 供实现阶段使用的占位引用，避免 lint 报未使用。
-    void randomUUID
-    void newSessionId
-    void persistRecords
+    log?.info?.(`${tag} loaded（投递与定位已可用：POST ${config.pathPrefix}${ROUTES.MESSAGE}）`)
   })
 }
 
@@ -353,6 +720,21 @@ function assertConfigIsUsable(config) {
   if (typeof config.sessionTitleTemplate !== 'string' || config.sessionTitleTemplate.trim() === '') {
     throw new Error('dsh-astrbot-relay: sessionTitleTemplate 不能为空（它承担反向定位，空标题等于定位失效）')
   }
+  // 以下三项 schema 里有、实现里没有：**加载期就响亮地失败**，
+  // 而不是让人配上去、跑起来，再对「为什么没生效」百思不得其解。
+  if (config.hmacMode === true) {
+    throw new Error('dsh-astrbot-relay: hmacMode 尚未实现（契约 §5.2 的请求体签名校验），'
+      + '置 true 只是让人以为开了强化')
+  }
+  if (config.policy !== POLICY.ONE_TO_ONE) {
+    throw new Error(`dsh-astrbot-relay: policy=${JSON.stringify(config.policy)} 尚未实现`
+      + `（轮转策略目前只写进 state.json、不执行），只支持 ${POLICY.ONE_TO_ONE}`)
+  }
+  if (Number(config.idleTtlMs) !== 86_400_000) {
+    throw new Error('dsh-astrbot-relay: idleTtlMs 尚未实现（没有按空闲时长回收会话的逻辑），'
+      + '改它不会有任何效果')
+  }
+
   // 渲染一次做冒烟：模板里未知占位符会原样保留，这里只保证渲染本身不抛错。
   const probe = renderSessionTitle(config.sessionTitleTemplate, 'platform:MessageType:0')
   if (probe.trim() === '') {
