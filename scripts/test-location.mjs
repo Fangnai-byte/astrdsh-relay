@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  CWD_SOURCE, STATE_VERSION, normalizeRecord, parseConversation, parseState,
+  CWD_SOURCE, STATE_VERSION, newRecord, normalizeRecord, parseConversation, parseState,
   renderSessionTitle, resolveLocation, serializeState,
 } from '../dsh-astrbot-relay/lib/location.js'
 import { loadState, resolveStatePath, saveState } from '../dsh-astrbot-relay/lib/state.js'
@@ -142,6 +142,54 @@ test('某条记录不是对象被拒绝，且错误里带出该会话键', () =>
   const parsed = parseState({ version: STATE_VERSION, conversations: { 'k:1:2': 'oops' } })
   assert.equal(parsed.ok, false)
   assert.match(parsed.reason, /k:1:2/)
+})
+
+console.log('\nnewRecord')
+
+test('newRecord：字段集合与 normalizeRecord 完全一致（形状只留一份权威）', () => {
+  const record = newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1', now: 1700000000000 })
+  assert.deepStrictEqual(record, normalizeRecord('p:M:s', record))
+  assert.deepStrictEqual(
+    Object.keys(record).sort(),
+    Object.keys(normalizeRecord('p:M:s', {})).sort(),
+  )
+})
+
+test('newRecord：cwd 默认 null（跟随全局），不把当时的全局值烙进记录', () => {
+  const record = newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1' })
+  assert.equal(record.cwd, null)
+  assert.equal(record.policy, null)
+})
+
+test('newRecord：seq 从 0 起算，外部塞进来的 seq 无效', () => {
+  assert.equal(newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1' }).seq, 0)
+  assert.equal(newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1', seq: 99 }).seq, 0)
+})
+
+test('newRecord：createdAt/lastActiveAt 取 now（默认当期时间）', () => {
+  const record = newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1', now: 123 })
+  assert.equal(record.createdAt, 123)
+  assert.equal(record.lastActiveAt, 123)
+  assert.ok(newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1' }).createdAt > 0)
+})
+
+test('newRecord：空串 cwd 归 null；非串 cwd 也归 null（宽容策略与读入侧一致）', () => {
+  assert.equal(newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1', cwd: '   ' }).cwd, null)
+  assert.equal(newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1', cwd: 123 }).cwd, null)
+})
+
+test('newRecord → 序列化 → 读回，记录原样回来（写出字段 = 读入字段）', () => {
+  const record = newRecord({ conversation: 'p:M:s', dshSessionId: 'im-1', cwd: '/w', now: 456 })
+  const back = parseState(serializeState([record]))
+  assert.equal(back.ok, true)
+  assert.deepStrictEqual(back.records, [record])
+})
+
+test('newRecord：缺 id / 非串 / 空白 → 抛错，绝不造出「没有会话」的记录（§12.5）', () => {
+  throws(() => newRecord({ conversation: 'p:M:s' }), /dshSessionId/, '缺 id 应抛错')
+  throws(() => newRecord({ conversation: 'p:M:s', dshSessionId: null }), /dshSessionId/, 'null 应抛错')
+  throws(() => newRecord({ conversation: 'p:M:s', dshSessionId: 42 }), /dshSessionId/, '非串应抛错')
+  throws(() => newRecord({ conversation: 'p:M:s', dshSessionId: '  ' }), /dshSessionId/, '空白串应抛错')
 })
 
 console.log('\nserializeState / resolveLocation')
