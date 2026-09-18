@@ -56,9 +56,12 @@ def format_location(info: Any) -> list[str]:
     else:
         lines.append("· 工作目录：未配置")
 
-    workspace_id = info.get("workspaceId")
-    if isinstance(workspace_id, str) and workspace_id.strip():
-        lines.append(f"· 工作区 id：{workspace_id}")
+    # ⚠️ 两套命名空间（契约 §12.5），别被字段名误导：
+    #   state.json 持久化字段叫 dshSessionId；
+    #   /where 面向 IM 的响应字段叫 sessionId，**值就是 DSH 会话 id**。
+    # 桥接端做的是「读新名、答旧名」的显式转译，这里不必追新名。
+    # 历史上这里还读过 ``workspaceId``，但桥接端早已不再输出该字段，
+    # 那是个恒空分支——留着只会让后来人以为协议里有这么个东西，故删除。
 
     if not info.get("found", False):
         lines.append("· 该对话尚无绑定记录（上面的工作目录是新会话将使用的位置）")

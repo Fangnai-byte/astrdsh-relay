@@ -46,11 +46,17 @@ KNOWN_EVENT_TYPES = frozenset({
 })
 
 #: 统一错误码。契约 §8。
+#: ``unsupported`` 与 ``not_implemented`` 是两件事，别混：
+#:   - unsupported（400）：**请求**不合法（缺字段、类型错、Idempotency-Key 非 UUIDv4）。
+#:   - not_implemented（501）：请求合法，但**网桥那一端还没做**。
+#: 骨架阶段把两者混成 400，IM 侧会误以为是自己写错了参数，
+#: 于是反复重试一个必然失败的请求。
 ERROR_UNAUTHORIZED = "unauthorized"
 ERROR_NOT_FOUND = "not_found"
 ERROR_QUEUE_FULL = "queue_full"
 ERROR_AGENT_BUSY = "agent_busy"
 ERROR_UNSUPPORTED = "unsupported"
+ERROR_NOT_IMPLEMENTED = "not_implemented"
 ERROR_INTERNAL = "internal"
 
 #: 可重试的错误码（含纯传输层失败）。契约 §6.2。
