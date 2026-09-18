@@ -189,15 +189,28 @@ function sha256(file) {
 }
 
 function notes(version, tag, sums, artifacts) {
-  const [tgz, zip] = artifacts
+  // 按**扩展名**取，不能按下标解构：readdirSync 给的是字典序，
+  // `astrbot_*.zip` 排在 `dsh-*.tgz` 前面，解构出来两者就对调了。
+  // （v0.1.0 的发布说明就是这么错的，发出去之后才发现。）
+  const tgz = artifacts.find((name) => name.endsWith('.tgz'))
+  const zip = artifacts.find((name) => name.endsWith('.zip'))
+  if (!tgz || !zip) {
+    fail(`产物命名异常，无法生成发布说明：tgz=${tgz}，zip=${zip}`)
+  }
   const ref = tag || `v${version}`
   return `# AstrDsh Relay（星驿）${ref}
 
-> ⚠️ **本版本是 P0 骨架，尚不可运行。**
-> 两个插件只搭好了结构、接口契约与配置面；未实现的端点会**明确**返回「未实现」
-> （DSH 侧 HTTP \`501 unsupported\`，AstrBot 侧 \`NotImplementedError\`），**不会**
-> 假装成功。现在安装它**不会**得到可用的 IM ↔ DSH 桥接。
-> 本版本的实际用途是：评审接口契约、验证安装链路、复现 API 核实结论。
+> ⚠️ **核心桥接尚未打通，但「定位」已经可用。**
+>
+> **已实现**（有单测覆盖）：DSH 侧 \`GET /where\`、\`GET /conversations\`、\`GET /health\`；
+> AstrBot 侧 \`/dsh where\` 命令；两侧的 state 持久化、配置校验与 Bearer 鉴权。
+> 它们回答的问题是「这个 IM 对话落在哪个工作区、对应哪个 DSH 会话」。
+>
+> **未实现**（会**明确**返回「未实现」，不会假装成功）：\`POST /message\`、
+> \`GET /events\`（SSE 流式）、\`POST /approval\`（审批转发），以及 agent 会话驱动本身。
+> 也就是说：**现在装上它还发不出消息、也收不到回复**。
+>
+> 本版本的实际用途是：评审接口契约、验证安装链路、用定位能力排查配置。
 
 ## 产物
 
