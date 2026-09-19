@@ -543,14 +543,14 @@ export function apply(ctx, config) {
         bridge.agent = handle.agent
         bridge.dispose = handle.dispose
 
-        agent.followup(createUserMessage({
+        bridge.agent.followup(createUserMessage({
           content: [{ type: 'text', text }],
           source: { kind: 'user' },
         }))
 
         // 3) 不阻塞响应：空闲后 flush 会话记录再放掉在途计数（契约 §9 顺序）。
-        agent.whenIdle()
-          .then(() => host.sessions.flush(agent.session))
+        bridge.agent.whenIdle()
+          .then(() => host.sessions.flush(bridge.agent.session))
           .catch((error) => log?.warn?.(`${tag} 会话收尾失败：${String(error)}`))
           .finally(() => {
             bridge.queue = Math.max(0, bridge.queue - 1)
